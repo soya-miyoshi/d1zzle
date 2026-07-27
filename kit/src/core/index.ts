@@ -1,5 +1,5 @@
 /**
- * `d1zzle-kit/core` — the pure half: snapshots, diffing, introspection.
+ * `d1zzle-migrate/core` — the pure half: snapshots, diffing, introspection.
  *
  * No Node builtins and no filesystem, so it runs anywhere the schema does —
  * including inside workerd, which is where the migration engine is tested

@@ -59,8 +59,8 @@ all comparison and aggregate operators · `defineRelations()` (behind `d1zzle/re
 
 A consequence worth making explicit: if a d1zzle schema file is a valid Drizzle schema file
 modulo its import specifier, then **aliasing the import in reverse turns it back into a
-Drizzle schema**. That is what lets `d1zzle-kit studio` delegate to `drizzle-kit studio`
-instead of us building a data browser ([09](./09-d1zzle-kit.md#studio)).
+Drizzle schema**. That is what lets `d1zzle-migrate studio` delegate to `drizzle-kit studio`
+instead of us building a data browser ([09](./09-d1zzle-migrate.md#studio)).
 
 This makes "strict subset" a standing constraint, not just an aspiration:
 

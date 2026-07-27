@@ -2,7 +2,7 @@
  * Schema → DDL. A separate entry point: the core query builder never reaches
  * this module, so it costs the Worker bundle nothing (rule R5).
  *
- * `d1zzle-kit` generates migrations from exactly these strings, which is what
+ * `d1zzle-migrate` generates migrations from exactly these strings, which is what
  * keeps "what the schema says" and "what the migration does" in one place.
  */
 import type { Column } from './schema/columns.js';

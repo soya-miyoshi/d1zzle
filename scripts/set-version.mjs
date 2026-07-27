@@ -3,8 +3,8 @@
  *
  *   node scripts/set-version.mjs 0.2.0
  *
- * Three things have to move together — `d1zzle`'s version, `d1zzle-kit`'s
- * version, and `d1zzle-kit`'s peer range on `d1zzle` — and the release workflow
+ * Three things have to move together — `d1zzle`'s version, `d1zzle-migrate`'s
+ * version, and `d1zzle-migrate`'s peer range on `d1zzle` — and the release workflow
  * refuses to publish if they disagree. Doing it by hand across two files is
  * exactly the step that gets half-done, so it is a script.
  *
@@ -50,5 +50,5 @@ edit('kit/package.json', [
 	[/("d1zzle":\s*)"[^"]+"/, `$1"^${version}"`],
 ]);
 
-console.log(`d1zzle and d1zzle-kit are now ${version} (kit peer: ^${version}).`);
+console.log(`d1zzle and d1zzle-migrate are now ${version} (kit peer: ^${version}).`);
 console.log('Next: npm run check, commit, tag v' + version + ', draft the release.');

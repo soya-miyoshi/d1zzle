@@ -22,9 +22,9 @@
    schema now satisfies those too. See [08](./08-drizzle-compatibility.md) and
    [10](./10-ecosystem-interop.md).
 7. **Migration tooling that actually works on D1.** `drizzle-kit` for D1 is the weakest
-   part of the Drizzle-on-Workers story. A `d1zzle-kit` CLI with the same command surface,
+   part of the Drizzle-on-Workers story. A `d1zzle-migrate` CLI with the same command surface,
    built around D1's real constraints, is a first-class deliverable rather than an
-   afterthought. See [09-d1zzle-kit.md](./09-d1zzle-kit.md).
+   afterthought. See [09-d1zzle-migrate.md](./09-d1zzle-migrate.md).
 
 ## Non-goals
 
@@ -34,7 +34,7 @@
   legitimate answer and the README should say so.
 - **Interactive transactions.** D1 cannot do them. See [02](./02-d1-platform.md#no-interactive-transactions).
 - **A runtime migration engine.** Migrations are generated and applied by the CLI, never
-  by the Worker. `d1zzle-kit` is a devDependency and contributes **zero bytes** to the
+  by the Worker. `d1zzle-migrate` is a devDependency and contributes **zero bytes** to the
   Worker bundle; it may use Node freely. This is the line that keeps goal 7 from
   conflicting with goal 2.
 - **Runtime schema validation.** Zod/Valibot adapters belong in a separate package, if ever.

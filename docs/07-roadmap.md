@@ -64,7 +64,7 @@ and the kit's type check.
 
 - Views, CTEs, window functions, set operations (`union` / `intersect` / `except`).
 - Zod / Valibot / ArkType adapters — the Drizzle ones work via `asDrizzleSchema()`.
-- A native studio (see [09](./09-d1zzle-kit.md#studio)).
+- A native studio (see [09](./09-d1zzle-migrate.md#studio)).
 - Importing an existing `drizzle-kit` snapshot history. `pull` produces a baseline instead.
 - The benchmark harness from M1: bundle-size, cold-start and instantiation-count budgets are
   not yet wired into CI, so the size claims in these documents remain unmeasured.
@@ -75,7 +75,7 @@ The list below is the **original plan**, kept as written for provenance. Where i
 status table above disagree, the table is what shipped — and the deviations section says
 why. A few details here are stale on purpose: `test/compat/` became the shared fixture
 schema ([08](./08-drizzle-compatibility.md#verification)), and schema loading needs no
-worker thread because Node runs TypeScript directly ([09](./09-d1zzle-kit.md)).
+worker thread because Node runs TypeScript directly ([09](./09-d1zzle-migrate.md)).
 
 ### M0 — Toolchain proof
 
@@ -95,7 +95,7 @@ Per rule R7, the harness comes **before** the optimizations it is meant to justi
   ([08](./08-drizzle-compatibility.md)) — retrofitting `mode` options and the full modifier
   chain later would mean rewriting every column type.
 - `ddl.ts` — schema → `CREATE TABLE`, needed both for integration tests and as the
-  foundation `d1zzle-kit` generates migrations from.
+  foundation `d1zzle-migrate` generates migrations from.
 - Benchmarks: bundle size per entry point, cold-start CPU, `rows_read` per operation.
 - CI budgets: bundle size, and type-instantiation count from `tsgo --extendedDiagnostics`.
 
@@ -173,7 +173,7 @@ M1 still passes.
 *Done when:* nested queries return correct shapes and the core entry's size budget is
 unchanged, proving the entry-point split holds.
 
-### M8 — `d1zzle-kit`: generate and apply
+### M8 — `d1zzle-migrate`: generate and apply
 
 Separate package. Can start once M1's `ddl.ts` exists — it does **not** need the query
 builder, so it can proceed in parallel with M2–M6.
@@ -187,7 +187,7 @@ builder, so it can proceed in parallel with M2–M6.
 
 *Done when:* every fuzz-generated migration preserves data and round-trips through `pull`.
 
-### M9 — `d1zzle-kit`: introspection, drift, and push
+### M9 — `d1zzle-migrate`: introspection, drift, and push
 
 - `pull` from a live database → `schema.ts` + baseline snapshot.
 - Import of existing `drizzle-kit` snapshot history where feasible.
@@ -200,9 +200,9 @@ baseline reset, and `check` catches a manual `wrangler d1 execute` ALTER.
 ## Deferred
 
 - **A natively built studio.** Users get the Drizzle Studio browser extension (works today,
-  ORM-agnostic, zero effort) or an opt-in `d1zzle-kit studio` that delegates to
+  ORM-agnostic, zero effort) or an opt-in `d1zzle-migrate studio` that delegates to
   `drizzle-kit studio` via reverse import aliasing. See
-  [09](./09-d1zzle-kit.md#studio) — the delegation path is gated on verifying Drizzle
+  [09](./09-d1zzle-migrate.md#studio) — the delegation path is gated on verifying Drizzle
   Studio's licensing terms.
 - Views, CTEs, window functions, set operations (`union` / `intersect` / `except`).
 - Zod / Valibot / ArkType schema adapters.

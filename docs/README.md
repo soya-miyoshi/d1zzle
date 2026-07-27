@@ -16,7 +16,7 @@ shares no code with it and does not depend on it.
 | [06-runtime.md](./06-runtime.md) | Execution, result mapping, `batch()`, the Sessions API, observability |
 | [07-roadmap.md](./07-roadmap.md) | Phased implementation plan and current status |
 | [08-drizzle-compatibility.md](./08-drizzle-compatibility.md) | Accepting existing Drizzle schemas with a one-line import change |
-| [09-d1zzle-kit.md](./09-d1zzle-kit.md) | The migration CLI: commands, table recreation, drift detection |
+| [09-d1zzle-migrate.md](./09-d1zzle-migrate.md) | The migration CLI: commands, table recreation, drift detection |
 | [10-ecosystem-interop.md](./10-ecosystem-interop.md) | Being recognised by Drizzle's adapters: `entityKind`, symbols, and the one gap that cannot be closed |
 
 ## The short version
@@ -26,9 +26,9 @@ Two product commitments frame the work:
 - **Existing Drizzle schemas work unchanged**, modulo the import specifier — or with zero
   diff via a path alias — and **Drizzle's adapters accept them too**. See
   [08](./08-drizzle-compatibility.md) and [10](./10-ecosystem-interop.md).
-- **`d1zzle-kit` is a first-class deliverable**, not an afterthought, because `drizzle-kit`
+- **`d1zzle-migrate` is a first-class deliverable**, not an afterthought, because `drizzle-kit`
   on D1 is the weakest part of the current story. It is a devDependency and adds zero bytes
-  to the Worker bundle. See [09](./09-d1zzle-kit.md).
+  to the Worker bundle. See [09](./09-d1zzle-migrate.md).
 
 Three technical decisions drive most of the architecture:
 
@@ -50,7 +50,7 @@ Three technical decisions drive most of the architecture:
 ## Status
 
 Implemented and tested end to end: the query builder, the runtime, relations, the DDL
-generator and `d1zzle-kit`. Tests run in two projects — Node for the pure layers, workerd
+generator and `d1zzle-migrate`. Tests run in two projects — Node for the pure layers, workerd
 with a real D1 binding for everything that touches the platform.
 
 See [07-roadmap.md](./07-roadmap.md) for the milestone table and, more importantly, for the

@@ -7,7 +7,7 @@ import { appendEntry, emptyJournal, migrationName, migrationTag, nextIndex, pend
 import { applicableStatements, isPragma, splitStatements } from '../../src/core/sql.js';
 import { loadConfig, parseJsonc, readWranglerConfig } from '../../src/node/config.js';
 
-const temp = () => mkdtemp(join(tmpdir(), 'd1zzle-kit-'));
+const temp = () => mkdtemp(join(tmpdir(), 'd1zzle-migrate-'));
 
 describe('splitting a migration into statements', () => {
 	it('splits on semicolons', () => {

@@ -175,7 +175,7 @@ export async function loadConfig(cwd: string, configPath?: string): Promise<Conf
 	if (!user) {
 		throw new Error(
 			`No d1zzle config found. Create d1zzle.config.ts:\n\n`
-				+ `  import { defineConfig } from 'd1zzle-kit';\n\n`
+				+ `  import { defineConfig } from 'd1zzle-migrate';\n\n`
 				+ `  export default defineConfig({\n`
 				+ `    schema: './src/schema.ts',\n`
 				+ `    out: './migrations',\n`
@@ -192,7 +192,7 @@ export async function loadConfig(cwd: string, configPath?: string): Promise<Conf
 	return {
 		schema: user.schema,
 		// Wrangler's own default layout, so `wrangler d1 migrations apply` and
-		// `d1zzle-kit migrate` stay interchangeable.
+		// `d1zzle-migrate migrate` stay interchangeable.
 		out: user.out ?? wrangler?.migrations_dir ?? './migrations',
 		casing: user.casing ?? 'preserve',
 		migrationsTable: user.migrationsTable ?? 'd1_migrations',

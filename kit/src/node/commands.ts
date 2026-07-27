@@ -204,7 +204,7 @@ export async function pull(ctx: CommandContext, flags: TargetFlags = {}): Promis
 	// against whatever came before it. The migration file is empty on purpose:
 	// the live database is already in this state, so applying it is a no-op
 	// that only records the baseline in the migrations table.
-	await writeMigration(ctx.config.out, tag, `-- Baseline introspected by d1zzle-kit pull; nothing to apply.`);
+	await writeMigration(ctx.config.out, tag, `-- Baseline introspected by d1zzle-migrate pull; nothing to apply.`);
 	await writeSnapshot(ctx.config.out, index, { ...snapshot, id: tag });
 	await writeJournal(ctx.config.out, appendEntry(journal, tag, ctx.now()));
 

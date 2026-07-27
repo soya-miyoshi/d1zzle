@@ -5,9 +5,9 @@ Two packages, published in lockstep from one GitHub Release:
 | package | directory | notes |
 | --- | --- | --- |
 | `d1zzle` | `.` | the library |
-| `d1zzle-kit` | `kit/` | CLI; peer-depends on `d1zzle` |
+| `d1zzle-migrate` | `kit/` | CLI; peer-depends on `d1zzle` |
 
-They always share a version, and `d1zzle-kit`'s peer range is always `^<that
+They always share a version, and `d1zzle-migrate`'s peer range is always `^<that
 version>`. `.github/workflows/release.yml` refuses to publish if the tag and the two
 `package.json` versions disagree — npm has no unpublish story worth relying on, so the
 check runs before anything ships.
@@ -46,13 +46,13 @@ npm login
 npm run check          # typecheck → build → test → kit typecheck → kit build
 
 npm publish                      # d1zzle
-cd kit && npm publish && cd ..   # d1zzle-kit — publish AFTER d1zzle
+cd kit && npm publish && cd ..   # d1zzle-migrate — publish AFTER d1zzle
 ```
 
 > `npm pack`/`publish` select the package by **working directory**. `--prefix kit` reads
 > the root `package.json` and would publish `d1zzle` twice — use `cd kit`.
 
-Order matters: `d1zzle-kit` peer-depends on `d1zzle`, so the dependency should be resolvable
+Order matters: `d1zzle-migrate` peer-depends on `d1zzle`, so the dependency should be resolvable
 before the dependent lands.
 
 ### 3. Configure the trusted publisher
@@ -61,10 +61,10 @@ Once both names exist on the registry, from the CLI:
 
 ```bash
 npm trust github d1zzle     --repo <owner>/d1zzle --file release.yml --allow-publish
-npm trust github d1zzle-kit --repo <owner>/d1zzle --file release.yml --allow-publish
+npm trust github d1zzle-migrate --repo <owner>/d1zzle --file release.yml --allow-publish
 
 npm trust list d1zzle       # verify
-npm trust list d1zzle-kit
+npm trust list d1zzle-migrate
 ```
 
 `--allow-publish` is **required**, not optional: trusted-publisher configurations created
@@ -94,7 +94,7 @@ publish it. That fires `release.yml`, which:
 2. checks the tag matches both versions and that the peer range admits them;
 3. runs the full gate: typecheck → build → unit + workerd tests → kit typecheck → kit build;
 4. prints both tarball manifests;
-5. publishes `d1zzle`, then `d1zzle-kit`.
+5. publishes `d1zzle`, then `d1zzle-migrate`.
 
 Publishes use `--ignore-scripts` because step 3 already ran the gate and built both
 packages. Without it, `prepublishOnly` would run the entire test suite again per package,

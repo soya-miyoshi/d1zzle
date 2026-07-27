@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * `d1zzle-kit <command>`.
+ * `d1zzle-migrate <command>`.
  *
  * The command surface deliberately mirrors drizzle-kit, so existing muscle
  * memory and CI scripts transfer unchanged.
@@ -13,15 +13,15 @@ import { loadConfig } from './node/config.js';
 import type { CommandContext, TargetFlags } from './node/commands.js';
 import { check, generate, migrate, pull, push, up } from './node/commands.js';
 
-const USAGE = `d1zzle-kit — migrations for d1zzle on Cloudflare D1
+const USAGE = `d1zzle-migrate — migrations for d1zzle on Cloudflare D1
 
 Usage
-  d1zzle-kit generate [--name <name>] [--accept-data-loss] [renames]
-  d1zzle-kit migrate  [--local | --remote]
-  d1zzle-kit push     [--local | --remote] [--accept-data-loss] [renames]
-  d1zzle-kit pull     [--local | --remote] [--schema-out <file>] [--force]
-  d1zzle-kit check    [--local | --remote]
-  d1zzle-kit up
+  d1zzle-migrate generate [--name <name>] [--accept-data-loss] [renames]
+  d1zzle-migrate migrate  [--local | --remote]
+  d1zzle-migrate push     [--local | --remote] [--accept-data-loss] [renames]
+  d1zzle-migrate pull     [--local | --remote] [--schema-out <file>] [--force]
+  d1zzle-migrate check    [--local | --remote]
+  d1zzle-migrate up
 
 Options
   --config <path>       config file (default: d1zzle.config.ts)
@@ -191,7 +191,7 @@ export async function run(argv: readonly string[]): Promise<number> {
 			return 0;
 		case 'studio':
 			console.error(
-				'd1zzle-kit does not ship a studio. Use the Drizzle Studio browser extension — it\n'
+				'd1zzle-migrate does not ship a studio. Use the Drizzle Studio browser extension — it\n'
 					+ 'introspects the live database and works with d1zzle unchanged — or Cloudflare\'s\n'
 					+ 'D1 console in the dashboard.',
 			);
@@ -203,7 +203,7 @@ export async function run(argv: readonly string[]): Promise<number> {
 }
 
 // Only run when invoked as a binary, so the module stays importable.
-if (process.argv[1]?.endsWith('cli.js') || process.argv[1]?.endsWith('d1zzle-kit')) {
+if (process.argv[1]?.endsWith('cli.js') || process.argv[1]?.endsWith('d1zzle-migrate')) {
 	run(process.argv.slice(2)).then(
 		(code) => process.exit(code),
 		(error: unknown) => {

@@ -263,7 +263,7 @@ the test suite actually observed, running inside workerd against a live D1 bindi
 | Duplicate column names collide in keyed results | **Confirmed**, and handled: colliding projections are aliased `c0…cN` at compile time, and a join with two `id` columns maps correctly inside `batch()`. |
 | `.raw()` returns no `D1Meta` | **Confirmed.** This is why `onQuery` switches selects to the keyed path — see [06](./06-runtime.md#observability). |
 | `json_each` is available | **Confirmed.** A 201-element `inArray` runs as one bound parameter. |
-| `pragma table_info` / `index_list` / `index_info` / `foreign_key_list` | **All available**, and are what introspection is built on ([09](./09-d1zzle-kit.md)). |
+| `pragma table_info` / `index_list` / `index_info` / `foreign_key_list` | **All available**, and are what introspection is built on ([09](./09-d1zzle-migrate.md)). |
 | `sqlite_master` is readable | **Confirmed**, including index `sql` text, which is where partial-index `WHERE` clauses and `CHECK` constraints are recovered from. |
 | `CHECK`, composite `PRIMARY KEY`, partial and unique indexes, `RETURNING` | All work as declared, and are exercised by the fixture schema. |
 | Sessions and bookmarks | `withSession(...)` reads its own writes, and a bookmark round-trips into a second session. |

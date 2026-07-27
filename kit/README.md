@@ -1,16 +1,16 @@
-# d1zzle-kit
+# d1zzle-migrate
 
 Migrations, introspection and drift detection for [d1zzle](../README.md) on Cloudflare D1.
 
 A **devDependency**. It runs in Node, and contributes zero bytes to the Worker bundle.
 
 ```bash
-npm install -D d1zzle-kit
+npm install -D d1zzle-migrate
 ```
 
 ```ts
 // d1zzle.config.ts
-import { defineConfig } from 'd1zzle-kit';
+import { defineConfig } from 'd1zzle-migrate';
 
 export default defineConfig({
   schema: './src/schema.ts',
@@ -25,12 +25,12 @@ incidents, so there is only one place to state it.
 ## Commands
 
 ```
-d1zzle-kit generate      # diff schema against the last snapshot → a new SQL migration
-d1zzle-kit migrate       # apply pending migrations (--local | --remote)
-d1zzle-kit push          # diff and apply directly, no migration file (dev only)
-d1zzle-kit pull          # introspect a live database → schema.ts + baseline snapshot
-d1zzle-kit check         # detect drift and unapplied migrations; non-zero exit for CI
-d1zzle-kit up            # upgrade snapshot format after a kit version bump
+d1zzle-migrate generate      # diff schema against the last snapshot → a new SQL migration
+d1zzle-migrate migrate       # apply pending migrations (--local | --remote)
+d1zzle-migrate push          # diff and apply directly, no migration file (dev only)
+d1zzle-migrate pull          # introspect a live database → schema.ts + baseline snapshot
+d1zzle-migrate check         # detect drift and unapplied migrations; non-zero exit for CI
+d1zzle-migrate up            # upgrade snapshot format after a kit version bump
 ```
 
 Flags: `--local` (default) targets the `.wrangler` SQLite state; `--remote` goes through
@@ -67,7 +67,7 @@ the snapshot the migrations imply, and reports unapplied migrations, manual `ALT
 anything else that would make the next generated migration compute from a false baseline.
 
 **Wrangler stays interchangeable.** Migrations are written in wrangler's layout and
-recorded in wrangler's own `d1_migrations` table, so `d1zzle-kit migrate` and
+recorded in wrangler's own `d1_migrations` table, so `d1zzle-migrate migrate` and
 `wrangler d1 migrations apply` can be used against the same database.
 
 ## Studio
@@ -81,12 +81,12 @@ Cloudflare's D1 console in the dashboard.
 Every command is a plain function, and the diff engine is pure:
 
 ```ts
-import { diffSnapshots, renderMigration, snapshotFromSchema } from 'd1zzle-kit/core';
+import { diffSnapshots, renderMigration, snapshotFromSchema } from 'd1zzle-migrate/core';
 
 const sql = renderMigration(diffSnapshots(previousSnapshot, snapshotFromSchema(schema)));
 ```
 
-`d1zzle-kit/core` has no Node dependencies, so it also runs inside workerd — which is where
+`d1zzle-migrate/core` has no Node dependencies, so it also runs inside workerd — which is where
 the migration engine is tested against a real D1 database.
 
 ## License

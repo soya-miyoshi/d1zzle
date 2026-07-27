@@ -1,6 +1,6 @@
-# 09 — d1zzle-kit (CLI)
+# 09 — d1zzle-migrate (CLI)
 
-A separate package, `d1zzle-kit`, installed as a **devDependency**. It runs in Node, may
+A separate package, `d1zzle-migrate`, installed as a **devDependency**. It runs in Node, may
 use dependencies freely, and contributes **zero bytes** to the Worker bundle. That
 separation is what lets it be generous where the runtime must be austere.
 
@@ -40,12 +40,12 @@ command is written against it.
 Deliberately mirrors `drizzle-kit`, so existing muscle memory and CI scripts transfer.
 
 ```
-d1zzle-kit generate      # diff schema against last snapshot → new SQL migration
-d1zzle-kit migrate       # apply pending migrations (--local | --remote)
-d1zzle-kit push          # diff and apply directly, no migration file (dev only)
-d1zzle-kit pull          # introspect a live database → schema.ts + snapshot
-d1zzle-kit check         # detect drift and unapplied migrations; exit non-zero in CI
-d1zzle-kit up            # upgrade snapshot format after a kit version bump
+d1zzle-migrate generate      # diff schema against last snapshot → new SQL migration
+d1zzle-migrate migrate       # apply pending migrations (--local | --remote)
+d1zzle-migrate push          # diff and apply directly, no migration file (dev only)
+d1zzle-migrate pull          # introspect a live database → schema.ts + snapshot
+d1zzle-migrate check         # detect drift and unapplied migrations; exit non-zero in CI
+d1zzle-migrate up            # upgrade snapshot format after a kit version bump
 ```
 
 `studio` is **not implemented natively** — see [Studio](#studio) below for how users get a
@@ -55,7 +55,7 @@ data browser without us building one.
 
 ```ts
 // d1zzle.config.ts
-import { defineConfig } from 'd1zzle-kit';
+import { defineConfig } from 'd1zzle-migrate';
 
 export default defineConfig({
   schema: './src/schema.ts',
@@ -151,7 +151,7 @@ Two constraints follow:
 - A migration too large for one batch must be split, and **atomicity is then lost across
   the split**. The CLI warns loudly and names the split point rather than hiding it.
 - Applied migrations are tracked in a `d1_migrations` table. Using **wrangler's existing
-  table and layout** means `d1zzle-kit migrate` and `wrangler d1 migrations apply` stay
+  table and layout** means `d1zzle-migrate migrate` and `wrangler d1 migrations apply` stay
   interchangeable — teams can adopt the kit without giving up the wrangler workflow, and
   can fall back to it if the kit has a bug. That interoperability is worth more than a
   cleaner bespoke format.
@@ -210,7 +210,7 @@ names, `$type<T>()` brands, and enum narrowing do not surface.
 
 Because the schema DSL is source-compatible with Drizzle
 ([08](./08-drizzle-compatibility.md)), a user's `schema.ts` *is* a valid Drizzle schema
-file — the import specifier is the only difference. So `d1zzle-kit studio` can be a shim:
+file — the import specifier is the only difference. So `d1zzle-migrate studio` can be a shim:
 
 1. Resolve `d1zzle` → `drizzle-orm/sqlite-core` via a loader alias.
 2. Emit a throwaway `drizzle.config.ts` from our own config.
@@ -258,7 +258,7 @@ through its interface. That is the largest untested surface in the kit.
 ## Resolved, and still open
 
 1. **Migration state table** — resolved: wrangler's `d1_migrations` is reused, so
-   `d1zzle-kit migrate` and `wrangler d1 migrations apply` stay interchangeable.
+   `d1zzle-migrate migrate` and `wrangler d1 migrations apply` stay interchangeable.
 2. **Remote apply transport** — resolved: the D1 HTTP API directly. Cleaner and testable;
    no dependency on wrangler being installed.
 3. **Local state access** — resolved: `node:sqlite` reads the Miniflare SQLite file, so

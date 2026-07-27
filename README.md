@@ -11,7 +11,7 @@ bound-parameter limit, its Sessions API, and its billing counters.
 
 ```bash
 npm install d1zzle
-npm install -D d1zzle-kit
+npm install -D d1zzle-migrate
 ```
 
 ```ts
@@ -396,15 +396,15 @@ The peer range is `>=1.0.0-rc.1`: d1zzle presents v1's interface, and `asDrizzle
 prototypes onto v1's `OneV2`/`ManyV2` classes. On v0 it would silently prototype onto the
 wrong ones. Verified against rc.1 and rc.4.
 
-## d1zzle-kit
+## d1zzle-migrate
 
 Migrations, introspection and drift detection — a devDependency that adds nothing to the
 Worker bundle. See [kit/README.md](./kit/README.md).
 
 ```bash
-npx d1zzle-kit generate   # diff the schema against the last snapshot → a SQL migration
-npx d1zzle-kit migrate    # apply pending migrations (--local | --remote)
-npx d1zzle-kit check      # detect drift and unapplied migrations; non-zero exit for CI
+npx d1zzle-migrate generate   # diff the schema against the last snapshot → a SQL migration
+npx d1zzle-migrate migrate    # apply pending migrations (--local | --remote)
+npx d1zzle-migrate check      # detect drift and unapplied migrations; non-zero exit for CI
 ```
 
 ## Documentation
@@ -421,7 +421,7 @@ npm test        # unit tests in Node, integration tests inside workerd against r
 npm run check   # typecheck + build + tests + kit typecheck + kit build
 ```
 
-`d1zzle` and `d1zzle-kit` are released together from one GitHub Release, published to npm
+`d1zzle` and `d1zzle-migrate` are released together from one GitHub Release, published to npm
 with trusted publishing (OIDC — no tokens) and provenance attestations. `npm run version:set
 <version>` moves both packages and the kit's peer range in lockstep. See
 [RELEASING.md](./RELEASING.md).
