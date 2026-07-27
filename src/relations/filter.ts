@@ -1,0 +1,375 @@
+/**
+ * The RQBv2 filter DSL — `where` as an object rather than a callback.
+ *
+ * ```ts
+ * db.query.posts.findMany({
+ *   where: { views: { gt: 100 }, author: { role: 'admin' } },
+ * })
+ * ```
+ *
+ * Two things are worth knowing about the shape. A bare scalar is shorthand for
+ * `eq`, so `{ id: 1 }` and `{ id: { eq: 1 } }` are the same filter. And a key
+ * that names a *relation* rather than a column compiles to a correlated
+ * `exists (…)` against the target table — genuinely new capability here, and
+ * one the split-query executor absorbs without changing how children are
+ * fetched, because it lands in the parent's `where`.
+ *
+ * The semantics are taken from `drizzle-orm@1`'s `relationsFilterToSQL`, down
+ * to `false` on a relation key meaning `not exists` and an empty `AND: []`
+ * contributing nothing.
+ */
+import type { Column } from '../schema/columns.js';
+import type { Table } from '../schema/table.js';
+import { alias, getTableColumns, getTableOriginalName } from '../schema/table.js';
+import type { Condition } from '../sql/expressions.js';
+import {
+	and,
+	between,
+	eq,
+	exists,
+	gt,
+	gte,
+	ilike,
+	inArray,
+	isNotNull,
+	isNull,
+	like,
+	lt,
+	lte,
+	ne,
+	not,
+	notBetween,
+	notExists,
+	notIlike,
+	notInArray,
+	notLike,
+	or,
+} from '../sql/expressions.js';
+import type { Placeholder, SQLChunk } from '../sql/sql.js';
+import { isSQLChunk, sql } from '../sql/sql.js';
+import type { Relation, RelationsConfig } from './define.js';
+
+/**
+ * Postgres array operators. SQLite has no array type and no faithful stand-in,
+ * so these refuse rather than compile to something that quietly answers wrong.
+ */
+const postgresOnly = (name: string) => (): never => {
+	throw new Error(
+		`"${name}" is a Postgres array operator and has no SQLite equivalent. `
+			+ 'Store the collection in a related table, or filter it in JavaScript.',
+	);
+};
+
+/** The operator bag handed to a `RAW` callback, shaped as Drizzle's. */
+export const filterOperators = {
+	and,
+	between,
+	eq,
+	exists,
+	gt,
+	gte,
+	ilike,
+	inArray,
+	arrayContains: postgresOnly('arrayContains'),
+	arrayContained: postgresOnly('arrayContained'),
+	arrayOverlaps: postgresOnly('arrayOverlaps'),
+	isNull,
+	isNotNull,
+	like,
+	lt,
+	lte,
+	ne,
+	not,
+	notBetween,
+	notExists,
+	notLike,
+	notIlike,
+	notInArray,
+	or,
+	sql,
+};
+
+export type FilterOperators = typeof filterOperators;
+
+// ------------------------------------------------------------------- types
+
+/** Anything a comparison will accept on the right-hand side. */
+type Operand<T> = T | Placeholder<T>;
+
+/** The operator object for one column. */
+export interface ColumnFilterOperators<T> {
+	eq?: Operand<T>;
+	ne?: Operand<T>;
+	gt?: Operand<T>;
+	gte?: Operand<T>;
+	lt?: Operand<T>;
+	lte?: Operand<T>;
+	in?: readonly T[] | Placeholder<readonly T[]>;
+	notIn?: readonly T[] | Placeholder<readonly T[]>;
+	like?: Operand<string>;
+	ilike?: Operand<string>;
+	notLike?: Operand<string>;
+	notIlike?: Operand<string>;
+	isNull?: boolean;
+	isNotNull?: boolean;
+	NOT?: ColumnFilter<T>;
+	OR?: readonly ColumnFilter<T>[];
+	AND?: readonly ColumnFilter<T>[];
+}
+
+/** A bare value is shorthand for `{ eq: value }`. */
+export type ColumnFilter<T> = Operand<T> | ColumnFilterOperators<T>;
+
+/** The `RAW` escape hatch: a fragment, or a callback that builds one. */
+export type RawFilter =
+	| SQLChunk
+	| { getSQL(): unknown }
+	| ((table: Table, operators: FilterOperators) => SQLChunk | { getSQL(): unknown });
+
+/**
+ * A filter, untyped.
+ *
+ * `db.query` narrows this per table — see `TypedRelationsFilter` in
+ * `relations/index.ts`. This is the shape the compiler actually walks.
+ */
+export interface RelationsFilter {
+	AND?: readonly RelationsFilter[] | undefined;
+	OR?: readonly RelationsFilter[] | undefined;
+	NOT?: RelationsFilter | undefined;
+	RAW?: RawFilter | undefined;
+	[key: string]: unknown;
+}
+
+// ---------------------------------------------------------------- compiling
+
+const applyColumnOperator = (column: Column<any>, operator: string, value: unknown): Condition | undefined => {
+	switch (operator) {
+		case 'eq':
+			return eq(column, value);
+		case 'ne':
+			return ne(column, value);
+		case 'gt':
+			return gt(column, value);
+		case 'gte':
+			return gte(column, value);
+		case 'lt':
+			return lt(column, value);
+		case 'lte':
+			return lte(column, value);
+		case 'like':
+			return like(column, value as string);
+		case 'notLike':
+			return notLike(column, value as string);
+		case 'ilike':
+			return ilike(column, value as string);
+		case 'notIlike':
+			return notIlike(column, value as string);
+		case 'in':
+			return inArray(column, value as readonly unknown[]);
+		case 'notIn':
+			return notInArray(column, value as readonly unknown[]);
+		// `isNull: false` is not `is not null` — it is "no constraint", which is
+		// how Drizzle reads it. Only the truthy case emits anything.
+		case 'isNull':
+			return value ? isNull(column) : undefined;
+		case 'isNotNull':
+			return value ? isNotNull(column) : undefined;
+		case 'arrayContains':
+		case 'arrayContained':
+		case 'arrayOverlaps':
+			return postgresOnly(operator)();
+		default:
+			throw new Error(
+				`Unknown filter operator "${operator}" on column "${column.name}". `
+					+ 'Expected one of: eq, ne, gt, gte, lt, lte, in, notIn, like, notLike, ilike, notIlike, '
+					+ 'isNull, isNotNull, AND, OR, NOT.',
+			);
+	}
+};
+
+/**
+ * Compile the filter for a single column.
+ *
+ * A value that is not a plain object is the `eq` shorthand — which includes a
+ * `Placeholder`, an array (for a column whose data type is a JSON array) and
+ * `null`, none of which should be walked as an operator record.
+ */
+const compileColumnFilter = (column: Column<any>, filter: unknown): Condition | undefined => {
+	if (filter === null || typeof filter !== 'object' || isSQLChunk(filter) || Array.isArray(filter)) {
+		return eq(column, filter);
+	}
+
+	const parts: (Condition | undefined)[] = [];
+	for (const [operator, value] of Object.entries(filter as Record<string, unknown>)) {
+		if (value === undefined) continue;
+		switch (operator) {
+			case 'NOT': {
+				const inner = compileColumnFilter(column, value);
+				if (inner) parts.push(not(inner));
+				break;
+			}
+			case 'OR': {
+				const branches = value as readonly unknown[];
+				if (branches.length > 0) parts.push(or(...branches.map((b) => compileColumnFilter(column, b))));
+				break;
+			}
+			case 'AND': {
+				const branches = value as readonly unknown[];
+				if (branches.length > 0) parts.push(and(...branches.map((b) => compileColumnFilter(column, b))));
+				break;
+			}
+			default:
+				parts.push(applyColumnOperator(column, operator, value));
+		}
+	}
+	return and(...parts);
+};
+
+const resolveRaw = (raw: RawFilter, table: Table): SQLChunk | undefined => {
+	const produced = typeof raw === 'function' ? raw(table, filterOperators) : raw;
+	if (isSQLChunk(produced)) return produced;
+	const wrapped = (produced as { getSQL?: () => unknown }).getSQL?.();
+	if (isSQLChunk(wrapped)) return wrapped;
+	throw new Error('A `RAW` filter must be a SQL fragment, a SQLWrapper, or a function returning one.');
+};
+
+/**
+ * A relation key becomes a correlated subquery in the parent's `where`.
+ *
+ * `true` means "has at least one", `false` means "has none", and an object is
+ * a filter the related row must also satisfy. The target is aliased per depth
+ * so a self-relation — or the same table reached twice — cannot shadow the
+ * outer reference it is being correlated against.
+ */
+const compileRelationFilter = (
+	relation: Relation,
+	value: unknown,
+	sourceColumns: Record<string, Column<any>>,
+	config: RelationsConfig,
+	depth: number,
+): Condition | undefined => {
+	if (value === undefined) return undefined;
+
+	const target = alias(relation.targetTable, `d1zzle_f${depth}`);
+	const targetColumns = getTableColumns(target) as Record<string, Column<any>>;
+	const rebind = (columns: Record<string, Column<any>>) => {
+		const byName = new Map(Object.values(columns).map((c) => [c.name, c]));
+		return (column: Column<any>): Column<any> => byName.get(column.name) ?? column;
+	};
+	const rename = rebind(targetColumns);
+
+	const targetConfig = config[relation.targetTableName];
+	// A relation names the *declared* columns of its two tables. One level
+	// down, the table this filter applies to is itself an alias, so the
+	// correlating side has to be re-bound too or the subquery would compare
+	// against `"posts"."id"` when the outer row is `"d1zzle_f0"."id"`.
+	const outer = rebind(sourceColumns);
+	const source = (relation.sourceColumns ?? []).map(outer);
+	const targets = relation.targetColumns ?? [];
+
+	let joinTable: SQLChunk;
+	let joinCondition: Condition | undefined;
+
+	if (relation.through && relation.throughTable) {
+		const junction = alias(relation.throughTable, `d1zzle_ft${depth}`);
+		const junctionColumns = getTableColumns(junction) as Record<string, Column<any>>;
+		const junctionByName = new Map(Object.values(junctionColumns).map((c) => [c.name, c]));
+		const viaSource = relation.through.source.map((c) => junctionByName.get(c.name) ?? c);
+		const viaTarget = relation.through.target.map((c) => junctionByName.get(c.name) ?? c);
+
+		joinTable = sql`${sql.identifier(getTableOriginalName(relation.targetTable))} as ${target} inner join ${
+			sql.identifier(getTableOriginalName(relation.throughTable))
+		} as ${junction} on ${and(...viaTarget.map((c, i) => eq(c, rename(targets[i]!))))}`;
+		joinCondition = and(...source.map((c, i) => eq(c, viaSource[i]!)));
+	} else {
+		joinTable = sql`${sql.identifier(getTableOriginalName(relation.targetTable))} as ${target}`;
+		joinCondition = and(...source.map((c, i) => eq(c, rename(targets[i]!))));
+	}
+
+	const nested = typeof value === 'boolean' || value === null
+		? undefined
+		: compileFilter(value as RelationsFilter, target, targetColumns, targetConfig?.relations ?? {}, config, depth + 1);
+
+	// The relation's own `where`, if it has one, applies wherever it is used.
+	const declared = relation.where
+		? compileFilter(relation.where, target, targetColumns, targetConfig?.relations ?? {}, config, depth + 1)
+		: undefined;
+
+	const predicate = and(joinCondition, declared, nested);
+	const body = predicate
+		? sql`select 1 from ${joinTable} where ${predicate} limit 1`
+		: sql`select 1 from ${joinTable} limit 1`;
+
+	return value === false ? notExists(body) : exists(body);
+};
+
+/**
+ * Walk the object DSL and emit our own expressions.
+ *
+ * @param table the table the filter applies to — aliased, at depth > 0. It is
+ * handed to `RAW` callbacks, which is what lets Pothos build its batching
+ * predicate against the same columns we are filtering on.
+ */
+export function compileFilter(
+	filter: RelationsFilter | undefined,
+	table: Table,
+	columns: Record<string, Column<any>>,
+	relations: Record<string, Relation>,
+	config: RelationsConfig,
+	depth = 0,
+): Condition | undefined {
+	if (!filter) return undefined;
+
+	const parts: (Condition | undefined)[] = [];
+
+	for (const [key, value] of Object.entries(filter)) {
+		if (value === undefined) continue;
+
+		switch (key) {
+			case 'RAW':
+				parts.push(resolveRaw(value as RawFilter, table) as Condition);
+				continue;
+			case 'AND': {
+				const branches = value as readonly RelationsFilter[];
+				if (branches?.length) {
+					parts.push(and(...branches.map((b) => compileFilter(b, table, columns, relations, config, depth))));
+				}
+				continue;
+			}
+			case 'OR': {
+				const branches = value as readonly RelationsFilter[];
+				if (branches?.length) {
+					parts.push(or(...branches.map((b) => compileFilter(b, table, columns, relations, config, depth))));
+				}
+				continue;
+			}
+			case 'NOT': {
+				const inner = compileFilter(value as RelationsFilter, table, columns, relations, config, depth);
+				if (inner) parts.push(not(inner));
+				continue;
+			}
+			default:
+				break;
+		}
+
+		const column = columns[key];
+		if (column) {
+			parts.push(compileColumnFilter(column, value));
+			continue;
+		}
+
+		const relation = relations[key];
+		if (relation) {
+			parts.push(compileRelationFilter(relation, value, columns, config, depth));
+			continue;
+		}
+
+		throw new Error(
+			`Unknown filter field "${key}". It is neither a column nor a relation of this table. `
+				+ `Columns: ${Object.keys(columns).join(', ')}. `
+				+ `Relations: ${Object.keys(relations).join(', ') || '(none)'}.`,
+		);
+	}
+
+	return and(...parts);
+}

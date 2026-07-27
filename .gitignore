@@ -1,0 +1,10 @@
+node_modules/
+dist/
+.wrangler/
+*.tsbuildinfo
+
+# Local scratch notes. Never committed.
+notes/
+
+# Local scratch copy of Drizzle, if present. Never vendored, never a dependency.
+drizzle-orm/

@@ -1,0 +1,28 @@
+# The gate `prepublishOnly` already runs locally, run on every push and PR.
+#
+# `npm run check` is typecheck -> build -> test -> kit typecheck, in that order,
+# and the order matters: `test/unit/module-resolution.test.ts` bundles against
+# `dist/`, so it needs the build to have happened.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      # `npm ci` needs the lockfile to be in step with package.json; a drift
+      # here is itself worth failing on.
+      - run: npm ci
+
+      - run: npm run check

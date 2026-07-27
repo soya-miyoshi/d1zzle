@@ -1,0 +1,637 @@
+import type { D1Param, Query, RenderContext, SQLChunk } from '../sql/sql.js';
+import { Identifier, quoteIdentifier } from '../sql/sql.js';
+import type { DrizzleColumnType, DrizzleDataType, ToDrizzleDataType } from './drizzle-entity.js';
+import { dataTypeOf, entityKind, SQLiteColumnEntity } from './drizzle-entity.js';
+
+/** SQLite's storage classes — the only column types D1 actually has. */
+export type SQLiteType = 'integer' | 'text' | 'real' | 'blob' | 'numeric';
+
+export type ReferentialAction =
+	| 'cascade'
+	| 'restrict'
+	| 'no action'
+	| 'set null'
+	| 'set default';
+
+export interface ColumnDefault {
+	/** `sql` defaults are inlined into DDL; `value` defaults are literalised. */
+	readonly kind: 'value' | 'sql';
+	readonly value: unknown;
+}
+
+export interface ColumnReference {
+	readonly ref: () => Column;
+	readonly onDelete?: ReferentialAction | undefined;
+	readonly onUpdate?: ReferentialAction | undefined;
+}
+
+export interface ColumnConfig {
+	/** Explicit database name, when the user supplied one. */
+	explicitName?: string | undefined;
+	/** Property key on the table object; assigned by `table()`. */
+	fieldName: string;
+	type: SQLiteType;
+	/** Drizzle's class name for this column; adapters branch on it. */
+	columnType: DrizzleColumnType;
+	/** Drizzle-compatible `mode`; selects the encoder/decoder pair. */
+	mode?: string | undefined;
+	notNull: boolean;
+	primaryKey: boolean;
+	autoIncrement: boolean;
+	hasDefault: boolean;
+	default?: ColumnDefault | undefined;
+	defaultFn?: (() => unknown) | undefined;
+	onUpdateFn?: (() => unknown) | undefined;
+	unique: boolean;
+	uniqueName?: string | undefined;
+	length?: number | undefined;
+	enumValues?: readonly string[] | undefined;
+	references?: ColumnReference | undefined;
+	generated?: { readonly as: SQLChunk | string; readonly mode: 'stored' | 'virtual' } | undefined;
+	/** Encoder used when binding this column's values. */
+	encode: (value: unknown) => D1Param;
+	/**
+	 * Decoder for values coming back from D1. `undefined` means "already
+	 * correct" — the mapper skips the call entirely, which is the common case.
+	 */
+	decode?: ((value: unknown) => unknown) | undefined;
+}
+
+/**
+ * Identifier casing applied to columns that did not specify a database name.
+ *
+ * Set once by `d1zzle()` (or by the kit) and read lazily, so a schema module
+ * can be imported before the option is known.
+ */
+let casingMode: 'preserve' | 'snake_case' = 'preserve';
+/** Whether anyone has set it explicitly, as opposed to defaulting. */
+let casingConfigured = false;
+/** Set the first time a column name is resolved under the current setting. */
+let casingObserved = false;
+
+/**
+ * Reconfiguring is refused rather than honoured, and so is configuring late.
+ *
+ * `Column.name` reads this lazily, and a Workers isolate outlives the request,
+ * so a second `d1zzle(…, { casing })` with a different value would silently
+ * rewrite the SQL of every table already built — including for the first
+ * database.
+ *
+ * Setting it *after* a name has been read is the more dangerous case, because
+ * it is what the documented module-scope compilation does by construction: a
+ * query compiled at import time bakes `"firstName"` into its SQL, and the
+ * `d1zzle(env.DB, { casing: 'snake_case' })` that runs on the first request
+ * then makes every *later* reader say `first_name`. The compiled query keeps
+ * the old text and D1 answers "no such column" — at runtime, in production,
+ * for the one query that was optimised. Both cases throw here instead.
+ */
+export const configureCasing = (mode: 'preserve' | 'snake_case'): void => {
+	if (casingConfigured && casingMode !== mode) {
+		throw new Error(
+			`Casing is already configured as "${casingMode}" and cannot be changed to "${mode}": `
+				+ 'column names are resolved lazily and are shared across every database in this isolate.',
+		);
+	}
+	if (!casingConfigured && casingObserved && mode !== casingMode) {
+		throw new Error(
+			`Casing was set to "${mode}" after column names had already been read. Names resolve lazily, `
+				+ 'so anything compiled before this call — a query built at module scope, a createSchema() '
+				+ 'call — kept the old spelling and would now query columns that do not exist. Pass `casing` '
+				+ 'on the first d1zzle() call in the module graph, before any query is compiled.',
+		);
+	}
+	casingMode = mode;
+	casingConfigured = true;
+};
+
+/** @internal Test-only escape hatch; never call this from application code. */
+export const resetCasing = (): void => {
+	casingMode = 'preserve';
+	casingConfigured = false;
+	casingObserved = false;
+};
+
+export const getCasing = (): 'preserve' | 'snake_case' => casingMode;
+
+const toSnakeCase = (name: string): string =>
+	name
+		.replace(/([a-z0-9])([A-Z])/g, '$1_$2')
+		.replace(/([A-Z]+)([A-Z][a-z])/g, '$1_$2')
+		.toLowerCase();
+
+export const applyCasing = (name: string): string => {
+	// Latched here rather than in `Column.name`, so every path that resolves a
+	// name — DDL, snapshots, compilation — counts as having observed it.
+	casingObserved = true;
+	return casingMode === 'snake_case' ? toSnakeCase(name) : name;
+};
+
+/**
+ * The phantom metadata a column carries. One record, not five type parameters:
+ * cheaper for the checker and extensible without touching every signature.
+ */
+export interface ColumnMeta {
+	data: unknown;
+	notNull: boolean;
+	hasDefault: boolean;
+	/** Drizzle-facing metadata, carried so adapters can infer from our tables. */
+	dataType?: DrizzleDataType | undefined;
+	columnType?: DrizzleColumnType | undefined;
+	driverParam?: unknown;
+	enumValues?: readonly string[] | undefined;
+	/**
+	 * `true` for `generatedAlwaysAs()`. Read only by `InferInsert`, which drops
+	 * such columns: SQLite rejects any attempt to write one. Deliberately *not*
+	 * forwarded to `DrizzleColumnShape.generated` — see the note there.
+	 */
+	generated?: boolean | undefined;
+}
+
+export class Column<M extends ColumnMeta = ColumnMeta> extends SQLiteColumnEntity implements SQLChunk<M['data']> {
+	static override readonly [entityKind]: string = 'SQLiteColumn';
+
+	/** Phantom — declared, never assigned. Costs zero runtime bytes. */
+	declare readonly $: M;
+	declare readonly $type?: M['data'];
+	/** Phantom, shaped like Drizzle's `Column['_']` so adapters can infer. */
+	declare readonly _: DrizzleColumnShape<M>;
+
+	/** Set by `table()` once the column is attached to its table. */
+	tableName = '';
+	/** The table object itself — Drizzle adapters read `column.table`. */
+	table: unknown = undefined;
+
+	constructor(readonly config: ColumnConfig) {
+		super();
+	}
+
+	// ---- the surface Drizzle adapters read -------------------------------
+
+	get dataType(): DrizzleDataType {
+		return dataTypeOf(this.config.columnType);
+	}
+
+	get columnType(): DrizzleColumnType {
+		return this.config.columnType;
+	}
+
+	get hasDefault(): boolean {
+		return this.config.hasDefault;
+	}
+
+	get isUnique(): boolean {
+		return this.config.unique;
+	}
+
+	get uniqueName(): string | undefined {
+		return this.config.uniqueName;
+	}
+
+	get enumValues(): readonly string[] | undefined {
+		return this.config.enumValues;
+	}
+
+	get default(): unknown {
+		return this.config.default?.value;
+	}
+
+	get defaultFn(): (() => unknown) | undefined {
+		return this.config.defaultFn;
+	}
+
+	get onUpdateFn(): (() => unknown) | undefined {
+		return this.config.onUpdateFn;
+	}
+
+	get generated(): { as: SQLChunk | string; mode: 'stored' | 'virtual' } | undefined {
+		return this.config.generated;
+	}
+
+	get keyAsName(): boolean {
+		return this.config.explicitName === undefined;
+	}
+
+	getSQLType(): string {
+		return this.config.type;
+	}
+
+	mapFromDriverValue(value: unknown): unknown {
+		return value === null || value === undefined ? value : this.config.decode?.(value) ?? value;
+	}
+
+	mapToDriverValue(value: unknown): unknown {
+		return value === null || value === undefined ? value : this.config.encode(value);
+	}
+
+	/** Drizzle's `SQLWrapper`. */
+	getSQL(): SQLChunk {
+		return this;
+	}
+
+	/** The database column name, resolved against the configured casing. */
+	get name(): string {
+		return this.config.explicitName ?? applyCasing(this.config.fieldName);
+	}
+
+	get notNull(): boolean {
+		return this.config.notNull;
+	}
+
+	get primary(): boolean {
+		return this.config.primaryKey;
+	}
+
+	toQuery(ctx?: RenderContext): Query {
+		const column = quoteIdentifier(this.name);
+		if (!this.tableName || ctx?.bareColumns) return { sql: column, params: [] };
+		return { sql: `${quoteIdentifier(this.tableName)}.${column}`, params: [] };
+	}
+
+	/** @internal Clone for table aliasing. */
+	withTable(tableName: string): Column<M> {
+		const next = new (this.constructor as new (config: ColumnConfig) => Column<M>)(this.config);
+		next.tableName = tableName;
+		return next;
+	}
+}
+
+export const isColumn = (value: unknown): value is Column => value instanceof Column;
+
+/** Mirrors Drizzle's `Column['_']`, so its inference helpers accept ours. */
+export interface DrizzleColumnShape<M extends ColumnMeta> {
+	readonly brand: 'Column';
+	readonly tableName: string;
+	readonly name: string;
+	readonly dataType: ToDrizzleDataType<M['dataType']>;
+	readonly columnType: M['columnType'] extends DrizzleColumnType ? M['columnType'] : DrizzleColumnType;
+	readonly data: M['data'];
+	readonly driverParam: M['driverParam'];
+	readonly notNull: M['notNull'];
+	readonly hasDefault: M['hasDefault'];
+	readonly isPrimaryKey: boolean;
+	readonly isAutoincrement: boolean;
+	readonly hasRuntimeDefault: boolean;
+	readonly enumValues: M['enumValues'];
+	readonly baseColumn: never;
+	/**
+	 * Always `undefined`, never `M['generated']`. Drizzle's `OptionalKeyOnly`
+	 * treats a column with `generated` set as non-optional, which would drop
+	 * every defaultable column from the insert models its adapters infer.
+	 */
+	readonly generated: undefined;
+	readonly identity: undefined;
+	readonly dialect: 'sqlite';
+}
+
+/**
+ * One subclass per Drizzle column type, created lazily and cached. Adapters
+ * that ask `is(column, SQLiteInteger)` walk this constructor's `entityKind`.
+ */
+const columnClasses = new Map<DrizzleColumnType, new (config: ColumnConfig) => Column<any>>();
+
+export const columnClassFor = (columnType: DrizzleColumnType): new (config: ColumnConfig) => Column<any> => {
+	let cls = columnClasses.get(columnType);
+	if (!cls) {
+		cls = class extends Column<any> {
+			static override readonly [entityKind]: string = columnType;
+		};
+		columnClasses.set(columnType, cls);
+	}
+	return cls;
+};
+
+/** Builder returned by the column constructors; narrows the phantom record. */
+export class ColumnBuilder<M extends ColumnMeta = ColumnMeta> {
+	constructor(readonly config: ColumnConfig) {}
+
+	private with(patch: Partial<ColumnConfig>): any {
+		return new ColumnBuilder({ ...this.config, ...patch });
+	}
+
+	notNull(): ColumnBuilder<M & { notNull: true }> {
+		return this.with({ notNull: true });
+	}
+
+	primaryKey(options?: { autoIncrement?: boolean }): ColumnBuilder<M & { notNull: true; hasDefault: true }> {
+		return this.with({
+			primaryKey: true,
+			notNull: true,
+			autoIncrement: options?.autoIncrement ?? false,
+			// An INTEGER PRIMARY KEY is SQLite's rowid alias: always defaultable.
+			hasDefault: this.config.type === 'integer',
+		});
+	}
+
+	unique(name?: string): ColumnBuilder<M> {
+		return this.with({ unique: true, uniqueName: name });
+	}
+
+	default(value: M['data'] | SQLChunk): ColumnBuilder<M & { hasDefault: true }> {
+		const isSql = typeof value === 'object' && value !== null
+			&& typeof (value as SQLChunk).toQuery === 'function';
+		return this.with({
+			hasDefault: true,
+			default: { kind: isSql ? 'sql' : 'value', value },
+		});
+	}
+
+	/** Runtime default, evaluated per insert rather than baked into the DDL. */
+	$defaultFn(fn: () => M['data']): ColumnBuilder<M & { hasDefault: true }> {
+		return this.with({ hasDefault: true, defaultFn: fn });
+	}
+
+	$default(fn: () => M['data']): ColumnBuilder<M & { hasDefault: true }> {
+		return this.$defaultFn(fn);
+	}
+
+	/** Value written on every `update()` that touches this table. */
+	$onUpdate(fn: () => M['data']): ColumnBuilder<M & { hasDefault: true }> {
+		return this.with({ hasDefault: true, onUpdateFn: fn });
+	}
+
+	$onUpdateFn(fn: () => M['data']): ColumnBuilder<M & { hasDefault: true }> {
+		return this.$onUpdate(fn);
+	}
+
+	/** Escape hatch for branded ids and JSON payloads. */
+	$type<T>(): ColumnBuilder<Omit<M, 'data'> & { data: T }> {
+		return this as any;
+	}
+
+	references(
+		ref: () => Column,
+		actions?: { onDelete?: ReferentialAction; onUpdate?: ReferentialAction },
+	): ColumnBuilder<M> {
+		return this.with({
+			references: { ref, onDelete: actions?.onDelete, onUpdate: actions?.onUpdate },
+		});
+	}
+
+	generatedAlwaysAs(
+		expression: SQLChunk | string,
+		options?: { mode?: 'stored' | 'virtual' },
+	): ColumnBuilder<M & { hasDefault: true; generated: true }> {
+		return this.with({
+			hasDefault: true,
+			generated: { as: expression, mode: options?.mode ?? 'virtual' },
+		});
+	}
+
+	/** @internal */
+	build(fieldName: string): Column<M> {
+		const Cls = columnClassFor(this.config.columnType);
+		return new Cls({ ...this.config, fieldName }) as Column<M>;
+	}
+}
+
+const base = (
+	type: SQLiteType,
+	columnType: DrizzleColumnType,
+	name: string | undefined,
+	patch: Partial<ColumnConfig> = {},
+): ColumnConfig => ({
+	explicitName: name,
+	fieldName: '',
+	type,
+	columnType,
+	notNull: false,
+	primaryKey: false,
+	autoIncrement: false,
+	hasDefault: false,
+	unique: false,
+	encode: (value) => value as D1Param,
+	...patch,
+});
+
+/** Drizzle's `dataType`, derived from its column class name. */
+type DataTypeOf<CT extends DrizzleColumnType> = CT extends 'SQLiteInteger' | 'SQLiteReal' ? 'number'
+	: CT extends 'SQLiteBoolean' ? 'boolean'
+	: CT extends 'SQLiteTimestamp' ? 'date'
+	: CT extends 'SQLiteTextJson' | 'SQLiteBlobJson' ? 'json'
+	: CT extends 'SQLiteBlobBuffer' ? 'buffer'
+	: CT extends 'SQLiteBigInt' ? 'bigint'
+	: CT extends 'SQLiteCustomColumn' ? 'custom'
+	: 'string';
+
+/**
+ * The starting metadata for a fresh column.
+ *
+ * `notNull` and `hasDefault` start as `boolean`, not `false`, because the
+ * builder narrows by intersection: `boolean & true` is `true`, whereas
+ * `false & true` would be `never` and silently break every downstream check.
+ */
+type Meta<T, CT extends DrizzleColumnType, TDriver = unknown, TEnum extends readonly string[] | undefined = undefined> = {
+	data: T;
+	notNull: boolean;
+	hasDefault: boolean;
+	dataType: DataTypeOf<CT>;
+	columnType: CT;
+	driverParam: TDriver;
+	enumValues: TEnum;
+};
+
+/** `name?` may be omitted entirely, Drizzle-style: `integer({ mode: 'boolean' })`. */
+const splitArgs = <C>(a: string | C | undefined, b: C | undefined): [string | undefined, C | undefined] =>
+	typeof a === 'string' ? [a, b] : a === undefined ? [undefined, b] : [undefined, a];
+
+// ---------------------------------------------------------------- integer
+
+export interface IntegerConfig<TMode extends string> {
+	mode?: TMode;
+}
+
+type IntegerData<TMode> = TMode extends 'boolean' ? boolean
+	: TMode extends 'timestamp' | 'timestamp_ms' ? Date
+	: number;
+
+type IntegerColumnType<TMode> = TMode extends 'boolean' ? 'SQLiteBoolean'
+	: TMode extends 'timestamp' | 'timestamp_ms' ? 'SQLiteTimestamp'
+	: 'SQLiteInteger';
+
+const toDate = (value: unknown, scale: number): Date => new Date(Number(value) * scale);
+
+export function integer<TMode extends 'number' | 'boolean' | 'timestamp' | 'timestamp_ms' = 'number'>(
+	name?: string | IntegerConfig<TMode>,
+	config?: IntegerConfig<TMode>,
+): ColumnBuilder<Meta<IntegerData<TMode>, IntegerColumnType<TMode>, number>> {
+	const [columnName, options] = splitArgs(name, config);
+	const mode = options?.mode ?? 'number';
+
+	let patch: Partial<ColumnConfig>;
+	switch (mode) {
+		case 'boolean':
+			patch = { encode: (v) => (v ? 1 : 0), decode: (v) => Boolean(v) };
+			break;
+		case 'timestamp':
+			patch = {
+				encode: (v) => Math.floor((v as Date).getTime() / 1000),
+				decode: (v) => toDate(v, 1000),
+			};
+			break;
+		case 'timestamp_ms':
+			patch = { encode: (v) => (v as Date).getTime(), decode: (v) => toDate(v, 1) };
+			break;
+		default:
+			patch = {};
+	}
+
+	const columnType: DrizzleColumnType = mode === 'boolean'
+		? 'SQLiteBoolean'
+		: mode === 'timestamp' || mode === 'timestamp_ms'
+		? 'SQLiteTimestamp'
+		: 'SQLiteInteger';
+
+	return new ColumnBuilder(base('integer', columnType, columnName, { mode, ...patch }));
+}
+
+// ------------------------------------------------------------------- text
+
+export interface TextConfig<TEnum extends readonly string[]> {
+	length?: number;
+	enum?: TEnum;
+	mode?: 'text' | 'json';
+}
+
+export function text<TEnum extends readonly string[] = readonly string[]>(
+	name?: string | TextConfig<TEnum>,
+	config?: TextConfig<TEnum>,
+): ColumnBuilder<Meta<TEnum[number], 'SQLiteText', string, TEnum>> {
+	const [columnName, options] = splitArgs(name, config);
+	const json = options?.mode === 'json';
+
+	return new ColumnBuilder(base('text', json ? 'SQLiteTextJson' : 'SQLiteText', columnName, {
+		mode: options?.mode ?? 'text',
+		length: options?.length,
+		enumValues: options?.enum,
+		...(json
+			? { encode: (v) => JSON.stringify(v), decode: (v) => JSON.parse(String(v)) as unknown }
+			: {}),
+	}));
+}
+
+// ------------------------------------------------------------------- real
+
+export function real(name?: string): ColumnBuilder<Meta<number, 'SQLiteReal', number>> {
+	return new ColumnBuilder(base('real', 'SQLiteReal', name));
+}
+
+// ---------------------------------------------------------------- numeric
+
+export function numeric(name?: string): ColumnBuilder<Meta<string, 'SQLiteNumeric', string>> {
+	return new ColumnBuilder(base('numeric', 'SQLiteNumeric', name, { decode: (v) => String(v) }));
+}
+
+// ------------------------------------------------------------------- blob
+
+/**
+ * D1 hands a blob back as a plain array of byte values, not a typed array —
+ * so every conversion here has to accept `number[]` before its fallback. It is
+ * the read shape, and missing it is silent: `String([0, 170, 187])` is
+ * `"0,170,187"`, which re-encodes to eleven bytes of ASCII rather than three
+ * bytes of data, and the value stops equalling the one that was written.
+ */
+const asBytes = (value: unknown): Uint8Array | undefined => {
+	if (value instanceof Uint8Array) return value;
+	if (value instanceof ArrayBuffer) return new Uint8Array(value);
+	if (ArrayBuffer.isView(value)) {
+		const view = value as ArrayBufferView;
+		return new Uint8Array(view.buffer, view.byteOffset, view.byteLength);
+	}
+	if (Array.isArray(value)) return Uint8Array.from(value as number[]);
+	return undefined;
+};
+
+const bytesToString = (value: unknown): string => {
+	if (typeof value === 'string') return value;
+	const bytes = asBytes(value);
+	return bytes ? new TextDecoder().decode(bytes) : String(value);
+};
+
+const toBytes = (value: unknown): Uint8Array => asBytes(value) ?? new TextEncoder().encode(String(value));
+
+export interface BlobConfig<TMode extends string = 'buffer' | 'json' | 'bigint'> {
+	mode?: TMode;
+}
+
+type BlobData<TMode> = TMode extends 'json' ? unknown : TMode extends 'bigint' ? bigint : Uint8Array;
+
+type BlobColumnType<TMode> = TMode extends 'json' ? 'SQLiteBlobJson'
+	: TMode extends 'bigint' ? 'SQLiteBigInt'
+	: 'SQLiteBlobBuffer';
+
+export function blob<TMode extends 'buffer' | 'json' | 'bigint' = 'buffer'>(
+	name?: string | BlobConfig<TMode>,
+	config?: BlobConfig<TMode>,
+): ColumnBuilder<Meta<BlobData<TMode>, BlobColumnType<TMode>, Uint8Array>> {
+	const [columnName, options] = splitArgs(name, config);
+	const mode = options?.mode ?? 'buffer';
+
+	let patch: Partial<ColumnConfig>;
+	switch (mode) {
+		case 'json':
+			patch = {
+				encode: (v) => JSON.stringify(v),
+				decode: (v) => JSON.parse(bytesToString(v)) as unknown,
+			};
+			break;
+		case 'bigint':
+			patch = { encode: (v) => String(v), decode: (v) => BigInt(bytesToString(v)) };
+			break;
+		default:
+			patch = { encode: (v) => v as D1Param, decode: (v) => toBytes(v) };
+	}
+
+	const columnType: DrizzleColumnType = mode === 'json'
+		? 'SQLiteBlobJson'
+		: mode === 'bigint'
+		? 'SQLiteBigInt'
+		: 'SQLiteBlobBuffer';
+
+	return new ColumnBuilder(base('blob', columnType, columnName, { mode, ...patch }));
+}
+
+/**
+ * An `integer` column carrying a boolean. Equivalent to
+ * `integer({ mode: 'boolean' })`, which is the Drizzle-compatible spelling.
+ */
+export function boolean(name?: string): ColumnBuilder<Meta<boolean, 'SQLiteBoolean', number>> {
+	return integer(name, { mode: 'boolean' }) as ColumnBuilder<Meta<boolean, 'SQLiteBoolean', number>>;
+}
+
+/** A `text` column carrying JSON. Equivalent to `text({ mode: 'json' })`. */
+export function json<T = unknown>(name?: string): ColumnBuilder<Meta<T, 'SQLiteTextJson', string>> {
+	return text(name, { mode: 'json' }) as unknown as ColumnBuilder<Meta<T, 'SQLiteTextJson', string>>;
+}
+
+// ------------------------------------------------------------ customType
+
+export interface CustomTypeParams<TData, TDriver, TConfig = unknown> {
+	dataType: (config?: TConfig) => SQLiteType | string;
+	toDriver?: (value: TData) => TDriver;
+	fromDriver?: (value: TDriver) => TData;
+}
+
+/**
+ * Drizzle's `customType`, mapped onto our encoder/decoder pair.
+ *
+ * `dataType(config)` is called per column, with the config from *that* column's
+ * call site — `varchar('name', { length: 10 })` — and not once when the type is
+ * declared. Calling it eagerly with no argument meant a `dataType` that read
+ * `config.length` threw at module scope, on import, before any query existed.
+ */
+export function customType<TData, TDriver = unknown, TConfig = unknown>(
+	params: CustomTypeParams<TData, TDriver, TConfig>,
+): (name?: string, config?: TConfig) => ColumnBuilder<Meta<TData, 'SQLiteCustomColumn', TDriver>> {
+	return (name?: string, config?: TConfig) => {
+		const declared = String(params.dataType(config));
+		const type = (['integer', 'text', 'real', 'blob', 'numeric'] as const)
+			.find((t) => declared.toLowerCase().includes(t)) ?? 'text';
+
+		return new ColumnBuilder(base(type, 'SQLiteCustomColumn', name, {
+			encode: params.toDriver ? (v) => params.toDriver!(v as TData) as D1Param : (v) => v as D1Param,
+			decode: params.fromDriver ? (v) => params.fromDriver!(v as TDriver) : undefined,
+		}));
+	};
+}
+
+export { Identifier };

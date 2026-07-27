@@ -1,0 +1,215 @@
+import { describe, expect, it } from 'vitest';
+import { and, CompileError, eq, ph, query, sql } from '../../src/index.js';
+import { setDev, setWarn } from '../../src/dev.js';
+import { integer, sqliteTable, text } from '../../src/index.js';
+import { posts, users } from '../schema.js';
+
+describe('insert compilation', () => {
+	it('inserts one row', () => {
+		const compiled = query.insert(posts).values({ id: 1, authorId: 2, title: 'hi' }).compile();
+
+		expect(compiled.sql).toBe(
+			'insert into "posts" ("id", "author_id", "title") values (?, ?, ?)',
+		);
+		expect(compiled.params.map((p) => (p as { v: unknown }).v)).toEqual([1, 2, 'hi']);
+		expect(compiled.parts).toHaveLength(1);
+	});
+
+	it('inserts several rows in one statement', () => {
+		const compiled = query.insert(posts)
+			.values([{ authorId: 1, title: 'a' }, { authorId: 2, title: 'b' }])
+			.compile();
+
+		expect(compiled.sql).toBe(
+			'insert into "posts" ("author_id", "title") values (?, ?), (?, ?)',
+		);
+	});
+
+	it('evaluates $defaultFn per execution rather than at compile time', () => {
+		const compiled = query.insert(users).values({ email: 'a@b.c' }).compile();
+
+		expect(compiled.sql).toBe('insert into "users" ("email", "created_at") values (?, ?)');
+		expect(compiled.params[1]).toMatchObject({ k: 'fn' });
+	});
+
+	it('chunks a large multi-row insert against the bound-parameter limit', () => {
+		const rows = Array.from({ length: 500 }, (_, i) => ({ authorId: 1, title: `t${i}` }));
+		const compiled = query.insert(posts).values(rows).compile();
+
+		// 2 columns per row, 100 parameters → 50 rows per statement.
+		expect(compiled.parts).toHaveLength(10);
+		expect(compiled.parts[0]!.params).toHaveLength(100);
+		expect(compiled.parts.reduce((n, p) => n + p.params.length, 0)).toBe(1000);
+	});
+
+	it('refuses a row wider than the parameter budget', () => {
+		expect(() => query.insert(posts).values({ authorId: 1, title: 'x' }).compile()).not.toThrow();
+		expect(() =>
+			query.insert(posts).values([{ authorId: 1, title: 'x' }]).compile()
+		).not.toThrow();
+	});
+
+	it('splits rows whose column sets differ', () => {
+		const compiled = query.insert(posts)
+			.values([{ authorId: 1, title: 'a' }, { authorId: 2, title: 'b', views: 3 }])
+			.compile();
+
+		expect(compiled.parts).toHaveLength(2);
+		expect(compiled.parts[1]!.sql).toContain('"views"');
+	});
+
+	it('supports onConflictDoNothing and onConflictDoUpdate', () => {
+		expect(
+			query.insert(users).values({ email: 'a@b.c' }).onConflictDoNothing().compile().sql,
+		).toContain('on conflict do nothing');
+
+		const upsert = query.insert(users).values({ email: 'a@b.c' })
+			.onConflictDoUpdate({ target: users.email, set: { name: 'x' }, where: eq(users.active, true) })
+			.compile();
+
+		expect(upsert.sql).toContain('on conflict ("email") do update set "name" = ? where "users"."active" = ?');
+	});
+
+	it('falls back to do nothing when the conflict set has nothing to assign', () => {
+		// Same rule as `update().set({ x: undefined })`, which the conflict path
+		// did not share: it rendered `do update set ` and D1 answered
+		// "incomplete input". An upsert with nothing to update *is* do-nothing,
+		// so unlike `update()` there is a sensible answer rather than an error.
+		const compiled = query.insert(users).values({ email: 'a@b.c' })
+			.onConflictDoUpdate({ target: users.email, set: { name: undefined } })
+			.compile();
+
+		expect(compiled.sql).toContain('on conflict ("email") do nothing');
+		expect(compiled.sql).not.toContain('do update set');
+	});
+
+	it('keeps the defined half of a partly-undefined conflict set', () => {
+		const compiled = query.insert(users).values({ email: 'a@b.c' })
+			.onConflictDoUpdate({ target: users.email, set: { name: 'x', role: undefined } })
+			.compile();
+
+		expect(compiled.sql).toContain('do update set "name" = ?');
+		expect(compiled.sql).not.toContain('"role"');
+	});
+
+	it('projects .returning()', () => {
+		const compiled = query.insert(posts).values({ authorId: 1, title: 'a' }).returning().compile();
+		expect(compiled.sql).toContain('returning "id", "author_id" as "authorId", "title", "views"');
+		expect(compiled.hasRows).toBe(true);
+
+		const narrow = query.insert(posts).values({ authorId: 1, title: 'a' })
+			.returning({ id: posts.id })
+			.compile();
+		expect(narrow.sql).toContain('returning "id"');
+	});
+
+	it('rejects an empty values list', () => {
+		expect(() => query.insert(posts).values([]).compile()).toThrow(CompileError);
+	});
+});
+
+describe('update compilation', () => {
+	it('sets columns and applies $onUpdate automatically', () => {
+		const compiled = query.update(users).set({ name: 'x' }).where(eq(users.id, 1)).compile();
+
+		expect(compiled.sql).toBe('update "users" set "name" = ?, "updated_at" = ? where "users"."id" = ?');
+		expect(compiled.params[1]).toMatchObject({ k: 'fn' });
+	});
+
+	it('treats an undefined value as unset rather than emitting an empty set clause', () => {
+		// `{ name: cond ? v : undefined }` is how a conditional update gets written.
+		const compiled = query.update(posts).set({ title: 'x', views: undefined }).compile();
+		expect(compiled.sql).toBe('update "posts" set "title" = ?');
+
+		expect(() => query.update(posts).set({ views: undefined }).compile())
+			.toThrow(/nothing to set/);
+	});
+
+	it('accepts sql expressions and placeholders as values', () => {
+		const compiled = query.update(posts)
+			.set({ views: sql`${posts.views} + 1`, title: ph('title') })
+			.compile();
+
+		expect(compiled.sql).toBe('update "posts" set "views" = "posts"."views" + 1, "title" = ?');
+		expect(compiled.params).toEqual([{ k: 'ph', name: 'title', encode: expect.any(Function) }]);
+	});
+
+	it('returns rows when asked', () => {
+		const compiled = query.update(posts).set({ title: 'x' }).returning({ id: posts.id }).compile();
+		expect(compiled.sql).toBe('update "posts" set "title" = ? returning "id"');
+	});
+
+	it('rejects an unknown column', () => {
+		expect(() => query.update(posts).set({ nope: 1 } as never).compile()).toThrow(CompileError);
+	});
+});
+
+describe('delete compilation', () => {
+	it('deletes with and without a predicate', () => {
+		expect(query.delete(posts).compile().sql).toBe('delete from "posts"');
+		expect(query.delete(posts).where(eq(posts.id, 1)).compile().sql)
+			.toBe('delete from "posts" where "posts"."id" = ?');
+	});
+
+	it('returns deleted rows', () => {
+		expect(query.delete(posts).returning({ id: posts.id }).compile().sql)
+			.toBe('delete from "posts" returning "id"');
+	});
+});
+
+describe('safety rails', () => {
+	it('warns in dev when an update or delete has no where clause', () => {
+		const messages: string[] = [];
+		setDev(true);
+		setWarn((message) => messages.push(message));
+
+		try {
+			query.update(posts).set({ title: 'x' }).compile();
+			query.delete(posts).compile();
+			// `and()` over all-undefined is undefined, which is how a whole-table
+			// write gets reached by accident.
+			query.delete(posts).where(and(undefined, undefined)).compile();
+		} finally {
+			setDev(false);
+		}
+
+		expect(messages).toHaveLength(3);
+		expect(messages[0]).toMatch(/update on "posts" has no where clause/);
+		expect(messages[1]).toMatch(/delete on "posts" has no where clause/);
+	});
+
+	it('says nothing when a where clause is present', () => {
+		const messages: string[] = [];
+		setDev(true);
+		setWarn((message) => messages.push(message));
+
+		try {
+			query.delete(posts).where(eq(posts.id, 1)).compile();
+		} finally {
+			setDev(false);
+		}
+
+		expect(messages).toEqual([]);
+	});
+});
+
+describe('generated columns are not writable', () => {
+	const flags = sqliteTable('flags', {
+		id: integer('id').primaryKey(),
+		name: text('name').notNull(),
+		shout: text('shout').generatedAlwaysAs(sql`upper("name")`),
+	});
+
+	it('leaves a generated column out of a plain insert', () => {
+		const compiled = query.insert(flags).values({ id: 1, name: 'x' }).compile();
+		expect(compiled.sql).toBe('insert into "flags" ("id", "name") values (?, ?)');
+	});
+
+	it('refuses a value for a generated column instead of letting D1 reject it', () => {
+		expect(() =>
+			// Unwritable in TypeScript — `shout` is absent from the insert model.
+			// This is the plain-JavaScript caller the guard exists for.
+			query.insert(flags).values({ id: 1, name: 'x', shout: 'nope' } as any).compile()
+		).toThrow(/"shout" is a generated column/);
+	});
+});

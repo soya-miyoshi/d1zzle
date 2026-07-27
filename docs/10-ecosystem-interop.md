@@ -1,0 +1,230 @@
+# 10 — Ecosystem interoperability
+
+[08](./08-drizzle-compatibility.md) scoped compatibility at the source level: match the
+call signatures, and put "anything under Drizzle's `~/` paths, `entityKind`, or the dialect
+classes" out of scope.
+
+That line turned out to be in the wrong place. It holds for *user code* — a schema file
+only uses the public DSL. It does not hold for **adapters**, and adapters are most of why
+Drizzle is worth adopting: the Zod/Valibot/TypeBox adapters, Pothos' drizzle plugin,
+Studio. None of them can work from the public API, because Drizzle does not
+have one for "describe this schema". They all read internals.
+
+So the target moved: a d1zzle schema should be indistinguishable from a Drizzle schema **to
+Drizzle's own code**.
+
+## What adapters actually read
+
+Three mechanisms, all of them internal:
+
+**1. `entityKind` on the constructor chain.** `is(value, SQLiteTable)` does not use
+`instanceof` — it walks the prototype chain of `value.constructor`, comparing a static
+symbol property against the target class's:
+
+```js
+// drizzle-orm/entity.js
+let cls = Object.getPrototypeOf(value).constructor;
+while (cls) {
+  if (entityKind in cls && cls[entityKind] === type[entityKind]) return true;
+  cls = Object.getPrototypeOf(cls);
+}
+```
+
+Two consequences. A table must be a **class instance**, not an object literal — a
+null-prototype object has no constructor and fails immediately. And it must have real
+**ancestors**, because a check against `Table` has to match somewhere above the check
+against `SQLiteTable`.
+
+**2. Well-known symbols.** `Symbol.for('drizzle:Name')`, `drizzle:Columns`,
+`drizzle:OriginalName`, `drizzle:Schema`, `drizzle:IsDrizzleTable`, and friends. This is
+how `getTableName()` and `getTableColumns()` work.
+
+**3. The column surface.** `.dataType`, `.columnType`, `.name`, `.notNull`, `.primary`,
+`.hasDefault`, `.enumValues`, `.isUnique`, `.table`, `.getSQLType()`,
+`.mapFromDriverValue()`, `.mapToDriverValue()`. Adapters branch on `dataType` to pick a
+GraphQL or Zod type, and on the concrete class — `is(column, SQLiteInteger)` — to decide
+whether a primary key is auto-generated.
+
+## What d1zzle does about it
+
+`src/schema/drizzle-entity.ts` declares the chain, and `columns.ts` creates one empty
+subclass per Drizzle column type, cached and instantiated by the column factories:
+
+```
+DrizzleTableEntity ('Table') → SQLiteTableEntity ('SQLiteTable') → D1zzleTable
+DrizzleColumnEntity ('Column') → SQLiteColumnEntity ('SQLiteColumn') → Column
+                                                                    → ('SQLiteInteger')
+                                                                    → ('SQLiteText')
+                                                                    → ('SQLiteBoolean') …
+```
+
+`table()` builds an instance of `D1zzleTable`, assigns the columns onto it, and attaches
+both our symbols and Drizzle's. Each column gets a back-reference to its table, because
+`column.table` is part of the surface.
+
+**This breaks rule R3** ([01](./01-principles.md#r3--prefer-closures-and-plain-objects-over-class-hierarchies)),
+deliberately and in exactly one file. The classes have no members; the cost is prototype
+setup for a handful of empty constructors.
+
+The relational layer follows the same principle. `defineRelations()` returns the plain
+`{ [tsName]: { table, name, relations } }` record Drizzle v1 produces — no class, no
+prototype, reproducible with zero imports — and the relation values carry the matching
+`RelationV2` / `OneV2` / `ManyV2` entity kinds. `db._` exposes `relations`, `schema`,
+`fullSchema`, `tableNamesMap` and `session`, because that is what schema-aware adapters
+read instead of asking.
+
+### Verified, not assumed
+
+`test/unit/drizzle-interop.test.ts` imports the **real `drizzle-orm`** as a devDependency
+and calls its functions on d1zzle objects:
+
+```ts
+is(users, SQLiteTable);        // true
+is(users, Table);              // true
+is(users.id, SQLiteInteger);   // true
+is(users.email, SQLiteInteger); // false — the negative case matters just as much
+getTableName(alias(users, 'author'));  // 'author'
+getTableColumns(users);        // every column, in declaration order
+```
+
+plus the column surface, every `mode`'s `dataType`/`columnType` pairing, and both
+directions of value mapping. If Drizzle changes how recognition works, this suite fails
+rather than some user's adapter.
+
+## The part that cannot be fixed
+
+Runtime recognition is solvable. **Type-level assignability to Drizzle's `Column` is not.**
+
+```ts
+export declare abstract class Column</* … */> {
+  protected config: ColumnRuntimeConfig<…>;   // ← this
+}
+```
+
+TypeScript considers a `protected` member compatible only when both types inherit it from
+the *same declaration*. That is a language rule with no structural workaround: no class
+that does not extend `drizzle-orm`'s `Column` can ever be assignable to it, no matter what
+shape it has. And extending it would make `drizzle-orm` a runtime dependency of the Worker
+bundle, which is the one thing this project cannot do.
+
+`Table` has no protected members, so tables are fine — but `InferSelectModel<T>` bottoms
+out in `Record<string, Column>` constraints, so the column rule propagates.
+
+### The escape hatch
+
+`d1zzle/drizzle` exports `asDrizzleSchema()` / `asDrizzleTable()`: identity at runtime,
+with a return type computed from the metadata each column already carries
+([04](./04-type-inference.md#column-types)).
+
+```ts
+import { asDrizzleSchema } from 'd1zzle/drizzle';
+
+const graphql = buildSchema(db as never, { schema: asDrizzleSchema(schema) });
+```
+
+`drizzle-orm` is an **optional peer dependency**. `asDrizzleSchema` / `asDrizzleTable`
+import types only and contribute nothing at runtime; `asDrizzleRelations` (below) is the
+one export that needs Drizzle's classes themselves. Nothing outside `d1zzle/drizzle`
+imports `drizzle-orm` at all, so a project that never touches an adapter never loads it.
+
+**Peer, not a dependency — for the same reason `asDrizzleRelations` exists.**
+
+```jsonc
+"peerDependencies":     { "drizzle-orm": ">=1.0.0-rc.1 <2" },
+"peerDependenciesMeta": { "drizzle-orm": { "optional": true } }
+```
+
+`instanceof` compares constructor *identity*. A regular dependency lets npm install a
+nested `node_modules/d1zzle/node_modules/drizzle-orm` on any version conflict — and then
+`asDrizzleRelations` re-prototypes onto **d1zzle's** `Many` while the plugin tests against
+**the app's** `Many`. Every `many` resolves as a single object again: exactly the bug this
+function was written to prevent, reintroduced by the dependency graph, invisible to
+TypeScript, and not caught by any test that installs a flat tree. A peer dependency is the
+declaration that there must be one copy and it belongs to the application.
+
+`optional: true` is what keeps that from taxing everyone else — npm 7+ installs peers
+automatically, and without the flag every d1zzle user would pull Drizzle to satisfy a
+constraint most of them never reach.
+
+The upper bound is deliberate. `>=1.0.0-rc.1` alone is satisfied by `2.0.0` and beyond, so
+a future major that renames or restructures `Many` / `One` would install clean and fail at
+runtime with the silent single-object bug — no warning, because the range said yes. Since
+the whole purpose of the peer dependency is guarding a fragile `instanceof` contract,
+leaving it open would undercut the reason for declaring it. `<2` makes that bump an
+explicit decision.
+
+Note that `^1.0.0-rc.1` would *not* be equivalent: a caret on a prerelease admits only
+prereleases of that same `1.0.0` and would reject the stable `1.0.0` when it ships. The
+range as written accepts `1.0.0-rc.1` through `1.x`, and rejects `0.44.0` and `2.0.0`.
+
+`test/unit/drizzle-types.test.ts` checks the result is honest: Drizzle's `InferSelectModel`
+and `InferInsertModel`, applied to `asDrizzleTable(users)`, agree with our own `InferSelect`
+/ `InferInsert` on every key and every value type — including `boolean` for
+`{ mode: 'boolean' }`, `Date` for timestamps, the narrowed enum union, and which keys are
+optional on insert.
+
+## `instanceof`, the mechanism the survey missed
+
+The three mechanisms above are all *structural* — `entityKind` walks, symbol reads, duck
+typing — and all three can be satisfied without importing `drizzle-orm`. A survey that
+greps for `is(` finds them.
+
+`@pothos/plugin-drizzle` has one line that is none of them:
+
+```js
+type: relationField instanceof Many ? [ref] : ref
+```
+
+`instanceof` consults the **right-hand** constructor's `Symbol.hasInstance` and prototype
+chain, so nothing we do on our side can satisfy it. There is no structural workaround, and
+the failure is silent: every `many` relation resolves as a single object instead of a list.
+
+`asDrizzleRelations()` closes it by giving each relation a shallow copy whose prototype is
+Drizzle's `One`/`Many`, carrying every field the plugin reads. The originals are untouched,
+so `db._.relations` and the query executor keep working on ours. This is the only place in
+the ecosystem where an `instanceof` has turned up; the lesson is that grepping for `is(`
+was not sufficient, and the next adapter deserves a real test rather than a survey.
+
+## Status by adapter
+
+| Adapter | Runtime | Types |
+| --- | --- | --- |
+| `drizzle-orm` core helpers (`is`, `getTableName`, `getTableColumns`) | Verified by test | Direct use needs `asDrizzleTable` |
+| Drizzle `SQL` fragments over d1zzle columns (`eq`, `inArray`, `sql`) | **Verified by test** — rendered through the bridge in `sql/drizzle-sql.ts` | n/a |
+| Pothos `plugin-drizzle` | **Verified end to end** — `test/workers/pothos.test.ts` executes GraphQL against real D1 in workerd. Needs our `getTableConfig` and `asDrizzleRelations` | Opt out with `DrizzleRelations: never`; see below |
+| Validator adapters (Zod, Valibot, TypeBox) | Read columns only; expected to work | `asDrizzleSchema` |
+| Drizzle Studio (extension) | Works — it introspects the live database and never sees our objects at all | n/a |
+
+The honest gaps:
+
+- **Adapters that check the database object.** `is(db, BaseSQLiteDatabase)` will not
+  recognise `D1zzleDatabase`; matching it would mean matching Drizzle's session and dialect
+  classes too — a far larger surface than the schema, and one whose behaviour we would then
+  have to keep in step. Nothing currently shipped needs it.
+
+  Adding that entity chain was scoped as its own phase, conditional on measuring whether
+  the one adapter that wanted it — drizzle-graphql — then got further. It does not, and the
+  reason is not ours: drizzle-graphql@0.8.5 is the latest release, it has no v1 build, and
+  it calls `createTableRelationsHelpers`, which `drizzle-orm@1` does not export at all
+  (nor `extractTablesRelationalConfig`, `normalizeRelation`, or `relations`). It cannot run
+  against Drizzle v1 whatever d1zzle does. Satisfying `is(db, BaseSQLiteDatabase)` would
+  only move its failure from a clear "unknown database instance type" to an undefined-is-
+  not-a-function further in — strictly worse. **Decided: not built**, and this is the
+  measurement rather than a deferral.
+- **Pothos' types — permanent, not pending.** The runtime contract is fully met and
+  tested. The *type* parameter `DrizzleRelations` slots against Drizzle's
+  `TablesRelationalConfig`, whose `table` is Drizzle's `Table` class, so the
+  protected-member rule above applies one level up. `DrizzleRelations: never` plus a cast
+  on `client` and `relations` is therefore the supported spelling, not an unfinished phase.
+  A `ToDrizzleTable`-style computed bridge would have to reproduce Drizzle's relation
+  *types* — `One`/`Many` with their own protected-member ancestry — rather than just its
+  column metadata, so it would hit the same wall it was meant to route around. What is lost
+  is autocompletion of table names inside the builder; what is kept is every runtime
+  guarantee, under test.
+- **`AggregatedField`.** Raised as an open question when the interface was scoped. Grepped
+  again against the plugin's runtime code: it references neither `AggregatedField` nor a
+  relation-count key, so `with` does not have to handle an aggregate in place of a
+  relation. The question is closed and nothing is owed.
+- **drizzle-graphql** was removed from this repo's devDependencies. It had sat there with
+  no test importing it, which is exactly the shape of an unverified claim, and it branches
+  on `is(db, BaseSQLiteDatabase)` — the gap above. It is not claimed as supported.

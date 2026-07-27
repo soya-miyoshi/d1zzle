@@ -1,0 +1,32 @@
+{
+  "compilerOptions": {
+    // Workers run on V8 isolates: modern JS, ESM only, no Node builtins.
+    "target": "ES2022",
+    "lib": ["ES2022"],
+    "module": "nodenext",
+    "moduleResolution": "nodenext",
+    "types": ["@cloudflare/workers-types", "@cloudflare/vitest-pool-workers"],
+
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": true,
+    "noImplicitOverride": true,
+    "noFallthroughCasesInSwitch": true,
+    "isolatedModules": true,
+    "verbatimModuleSyntax": true,
+    "skipLibCheck": true,
+
+    "declaration": true,
+    "declarationMap": true,
+    "sourceMap": true,
+    "noEmit": true,
+
+    "paths": {
+      "d1zzle": ["./src/index.ts"],
+      "d1zzle/ddl": ["./src/ddl.ts"],
+      "d1zzle/relations": ["./src/relations/index.ts"]
+    }
+  },
+  "include": ["src", "test", "kit/test"],
+  "exclude": ["drizzle-orm", "dist", "node_modules"]
+}

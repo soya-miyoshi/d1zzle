@@ -1,0 +1,112 @@
+{
+	"name": "d1zzle",
+	"version": "0.1.0",
+	"description": "A tiny, type-safe ORM built exclusively for Cloudflare D1 and Workers.",
+	"type": "module",
+	"license": "MIT",
+	"sideEffects": false,
+	"engines": {
+		"node": ">=20"
+	},
+	"exports": {
+		".": {
+			"types": "./dist/index.d.ts",
+			"default": "./dist/index.js"
+		},
+		"./core": {
+			"types": "./dist/core.d.ts",
+			"default": "./dist/core.js"
+		},
+		"./sqlite-core": {
+			"types": "./dist/sqlite-core.d.ts",
+			"default": "./dist/sqlite-core.js"
+		},
+		"./ddl": {
+			"types": "./dist/ddl.d.ts",
+			"default": "./dist/ddl.js"
+		},
+		"./relations": {
+			"types": "./dist/relations/index.d.ts",
+			"default": "./dist/relations/index.js"
+		},
+		"./drizzle": {
+			"types": "./dist/drizzle.d.ts",
+			"default": "./dist/drizzle.js"
+		},
+		"./package.json": "./package.json"
+	},
+	"files": [
+		"dist",
+		"!dist/**/*.tsbuildinfo",
+		"docs",
+		"README.md",
+		"LICENSE"
+	],
+	"dependencies": {},
+	"scripts": {
+		"build": "npm run clean && tsgo --project tsconfig.build.json",
+		"clean": "rm -rf dist",
+		"typecheck": "tsgo --noEmit",
+		"test": "vitest run",
+		"test:watch": "vitest",
+		"test:unit": "vitest run --project unit",
+		"test:workers": "vitest run --project workers",
+		"check": "npm run typecheck && npm run build && npm run test && npm run typecheck:kit && npm run build:kit",
+		"prepublishOnly": "npm run check",
+		"typecheck:kit": "npm run build && tsgo --project kit/tsconfig.json --noEmit",
+		"build:kit": "tsgo --project kit/tsconfig.build.json",
+		"version:set": "node scripts/set-version.mjs"
+	},
+	"devDependencies": {
+		"@cloudflare/vitest-pool-workers": "^0.9.0",
+		"@cloudflare/workers-types": "^5.20260722.1",
+		"@pothos/core": "^4.13.1",
+		"@pothos/plugin-drizzle": "^0.17.5",
+		"@types/node": "^24.13.3",
+		"@typescript/native-preview": "7.0.0-dev.20260707.2",
+		"drizzle-orm": "^1.0.0-rc.4",
+		"esbuild": "^0.28.1",
+		"graphql": "^16.14.2",
+		"vitest": "~3.2.0",
+		"wrangler": "^4.0.0"
+	},
+	"allowScripts": {
+		"workerd@1.20251011.0": true,
+		"workerd@1.20260722.1": true,
+		"esbuild@0.25.4": true,
+		"esbuild@0.28.1": true,
+		"sharp@0.33.5": true,
+		"sharp@0.35.2": true
+	},
+	"keywords": [
+		"cloudflare",
+		"d1",
+		"workers",
+		"sqlite",
+		"orm",
+		"query-builder",
+		"drizzle",
+		"typescript",
+		"edge"
+	],
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/soya-miyoshi/d1zzle.git"
+	},
+	"homepage": "https://github.com/soya-miyoshi/d1zzle#readme",
+	"bugs": {
+		"url": "https://github.com/soya-miyoshi/d1zzle/issues"
+	},
+	"author": "Soya Miyoshi",
+	"publishConfig": {
+		"access": "public"
+	},
+	"peerDependencies": {
+		"drizzle-orm": ">=1.0.0-rc.1 <2"
+	},
+	"peerDependenciesMeta": {
+		"drizzle-orm": {
+			"optional": true
+		}
+	}
+}

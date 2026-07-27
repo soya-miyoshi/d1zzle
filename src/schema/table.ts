@@ -1,0 +1,344 @@
+import { CompileError } from '../errors.js';
+import { MAX_COLUMNS_PER_TABLE } from '../limits.js';
+import type { Query, SQLChunk } from '../sql/sql.js';
+import { quoteIdentifier } from '../sql/sql.js';
+import type { Column, ColumnBuilder, ColumnMeta, ReferentialAction } from './columns.js';
+import type { TableExtra } from './constraints.js';
+import { foreignKeyName, indexName, isTableExtra, primaryKeyName, uniqueConstraintName } from './constraints.js';
+import {
+	DrizzleBaseName,
+	DrizzleColumns,
+	DrizzleExtraConfigBuilder,
+	DrizzleExtraConfigColumns,
+	DrizzleInlineForeignKeys,
+	DrizzleIsAlias,
+	DrizzleIsDrizzleTable,
+	DrizzleOriginalName,
+	DrizzleSchema,
+	DrizzleTableName,
+	entityKind,
+	SQLiteTableEntity,
+} from './drizzle-entity.js';
+
+export const TableName = Symbol.for('d1zzle:TableName');
+export const TableOriginalName = Symbol.for('d1zzle:TableOriginalName');
+export const TableColumns = Symbol.for('d1zzle:TableColumns');
+export const TableExtras = Symbol.for('d1zzle:TableExtras');
+export const IsTable = Symbol.for('d1zzle:IsTable');
+
+export type ColumnsMap = Record<string, Column<any>>;
+
+export interface TableMeta<TColumns extends ColumnsMap, TName extends string = string> extends SQLChunk {
+	readonly [IsTable]: true;
+	/** Effective name — the alias, when the table has been aliased. */
+	readonly [TableName]: TName;
+	readonly [TableOriginalName]: string;
+	readonly [TableColumns]: TColumns;
+	readonly [TableExtras]: readonly TableExtra[];
+}
+
+/**
+ * A table.
+ *
+ * Bare `Table` is the *metadata* shape only — every concrete table is
+ * assignable to it, which is what lets internals take `Table` without forcing
+ * an index signature onto user schemas. With type arguments it also carries
+ * the columns, for property access and inference.
+ */
+export type Table<TColumns extends ColumnsMap = never, TName extends string = string> =
+	[TColumns] extends [never] ? TableMeta<ColumnsMap, string>
+		: TColumns & TableMeta<TColumns, TName>;
+
+/** The table's name, at the type level — used to key joined result shapes. */
+export type NameOf<T> = T extends TableMeta<any, infer N> ? N : string;
+
+export type BuilderMap = Record<string, ColumnBuilder<any>>;
+
+export type BuiltColumns<T extends BuilderMap> = {
+	[K in keyof T]: T[K] extends ColumnBuilder<infer M extends ColumnMeta> ? Column<M> : never;
+};
+
+type ExtrasResult = readonly TableExtra[] | Record<string, TableExtra> | TableExtra | void;
+
+/**
+ * A table is an *instance* of a class whose static `entityKind` chain matches
+ * Drizzle's, and it carries Drizzle's symbols alongside our own. That is what
+ * makes `is(t, SQLiteTable)`, `getTableColumns(t)` and every existing Drizzle
+ * adapter work on a d1zzle schema unchanged. See `drizzle-entity.ts`.
+ */
+class D1zzleTable extends SQLiteTableEntity {
+	static override readonly [entityKind]: string = 'SQLiteTable';
+}
+
+const buildTable = (
+	name: string,
+	originalName: string,
+	columns: ColumnsMap,
+	extras: readonly TableExtra[],
+	isAliasOf = false,
+): Table => {
+	const meta: TableMeta<ColumnsMap> = {
+		[IsTable]: true,
+		[TableName]: name,
+		[TableOriginalName]: originalName,
+		[TableColumns]: columns,
+		[TableExtras]: extras,
+		toQuery: (): Query => ({ sql: quoteIdentifier(name), params: [] }),
+	};
+
+	const drizzleMeta = {
+		[DrizzleTableName]: name,
+		[DrizzleOriginalName]: originalName,
+		[DrizzleSchema]: undefined,
+		[DrizzleColumns]: columns,
+		[DrizzleExtraConfigColumns]: columns,
+		[DrizzleBaseName]: originalName,
+		[DrizzleIsAlias]: isAliasOf,
+		[DrizzleIsDrizzleTable]: true,
+		[DrizzleExtraConfigBuilder]: undefined,
+		[DrizzleInlineForeignKeys]: [],
+	};
+
+	const t = Object.assign(new D1zzleTable(), columns, meta, drizzleMeta) as unknown as Table;
+	for (const column of Object.values(columns)) column.table = t;
+	return t;
+};
+
+/**
+ * Declare a table. Property keys are the TypeScript-facing names; the column's
+ * own `name` argument (if given) is the database name.
+ *
+ * The third argument accepts both the current array-returning form and the
+ * legacy object-returning form, because real codebases contain both.
+ */
+export function table<TName extends string, TBuilders extends BuilderMap>(
+	name: TName,
+	builders: TBuilders,
+	extras?: (columns: BuiltColumns<TBuilders>) => ExtrasResult,
+): Table<BuiltColumns<TBuilders>, TName> {
+	const columns: ColumnsMap = {};
+
+	for (const [key, builder] of Object.entries(builders)) {
+		const column = builder.build(key);
+		column.tableName = name;
+		columns[key] = column;
+	}
+
+	// D1 caps a table at 100 columns, so a wider one cannot be created and no
+	// query against it can succeed. Thrown at declaration — module scope, once
+	// per isolate — because there is no later point at which the answer changes,
+	// and the alternative is a CREATE TABLE that fails inside a migration batch.
+	const columnCount = Object.keys(columns).length;
+	if (columnCount > MAX_COLUMNS_PER_TABLE) {
+		throw new CompileError(
+			`Table "${name}" declares ${columnCount} columns, which exceeds D1's limit of `
+				+ `${MAX_COLUMNS_PER_TABLE} per table. Split it, or move the rarely-read columns into a `
+				+ 'JSON column.',
+		);
+	}
+
+	let extraList: TableExtra[] = [];
+	if (extras) {
+		const result = extras(columns as BuiltColumns<TBuilders>);
+		if (Array.isArray(result)) extraList = result.filter(isTableExtra);
+		else if (isTableExtra(result)) extraList = [result];
+		else if (result) extraList = Object.values(result as Record<string, TableExtra>).filter(isTableExtra);
+	}
+
+	return buildTable(name, name, columns, extraList) as unknown as Table<BuiltColumns<TBuilders>, TName>;
+}
+
+/** Drizzle-compatible alias for {@link table}. */
+export const sqliteTable = table;
+
+export const isTable = (value: unknown): value is Table =>
+	typeof value === 'object' && value !== null && (value as Table)[IsTable] === true;
+
+export const getTableName = (t: Table): string => t[TableName];
+export const getTableOriginalName = (t: Table): string => t[TableOriginalName];
+export const getTableColumns = <T extends Table>(t: T): T[typeof TableColumns] => t[TableColumns];
+export const getTableExtras = (t: Table): readonly TableExtra[] => t[TableExtras];
+
+/**
+ * The introspected shape of a table, matching Drizzle v1's
+ * `getTableConfig` from `drizzle-orm/sqlite-core` field for field.
+ *
+ * Shipping our own is what makes the interop work rather than merely typecheck.
+ * Drizzle's version derives every constraint by *running* a table's
+ * `ExtraConfigBuilder`, which we set to `undefined` — so on a d1zzle table it
+ * returns the columns correctly and every other field empty. Pothos' drizzle
+ * plugin resolves a model's primary key with
+ * `columns.find(c => c.primary) ?? primaryKeys.find(…)?.columns ?? [columns.find(c => c.isUnique)]`,
+ * so an empty `primaryKeys` means a composite-key table has no primary key at
+ * all and the plugin throws. Ours reads our own `extras` instead.
+ *
+ * The user supplies `getTableConfig` to Pothos in its builder config, so this
+ * being *a* correct implementation is enough — Drizzle's never has to work on
+ * our tables.
+ */
+export interface TableConfig {
+	readonly name: string;
+	/** Always `undefined`: SQLite has no schemas. Present for shape parity. */
+	readonly schema: undefined;
+	readonly columns: readonly Column<any>[];
+	readonly indexes: readonly TableIndex[];
+	readonly foreignKeys: readonly TableForeignKey[];
+	readonly checks: readonly TableCheck[];
+	readonly primaryKeys: readonly TablePrimaryKey[];
+	readonly uniqueConstraints: readonly TableUniqueConstraint[];
+	/** Our own constraint records, unprocessed. Read by `d1zzle/ddl`. */
+	readonly extras: readonly TableExtra[];
+}
+
+export interface TableIndex {
+	readonly name: string;
+	readonly table: Table;
+	readonly columns: readonly (Column<any> | SQLChunk)[];
+	readonly unique: boolean;
+	readonly where: SQLChunk | undefined;
+}
+
+export interface TableForeignKey {
+	readonly name: string;
+	readonly table: Table;
+	readonly columns: readonly Column<any>[];
+	readonly foreignTable: Table | undefined;
+	readonly foreignColumns: readonly Column<any>[];
+	readonly onUpdate: ReferentialAction | undefined;
+	readonly onDelete: ReferentialAction | undefined;
+}
+
+export interface TableCheck {
+	readonly name: string;
+	readonly table: Table;
+	readonly value: SQLChunk;
+}
+
+export interface TablePrimaryKey {
+	readonly name: string;
+	readonly table: Table;
+	readonly columns: readonly Column<any>[];
+}
+
+export interface TableUniqueConstraint {
+	readonly name: string;
+	readonly table: Table;
+	readonly columns: readonly Column<any>[];
+}
+
+/**
+ * Introspect a table.
+ *
+ * Column-level `.primaryKey()` and `.unique()` stay on the column — as
+ * `primary` and `isUnique` — exactly as Drizzle reports them; only the
+ * *table-level* `primaryKey({ columns })` and `unique().on(…)` appear in
+ * `primaryKeys` and `uniqueConstraints`. That ordering is what Pothos'
+ * fallback chain is written against.
+ *
+ * `foreignKeys` includes the inline ones declared with `.references()`, which
+ * Drizzle also folds in.
+ */
+export const getTableConfig = (t: Table): TableConfig => {
+	const columns = Object.values(getTableColumns(t)) as Column<any>[];
+	const extras = getTableExtras(t);
+	const name = getTableName(t);
+
+	const indexes: TableIndex[] = [];
+	const foreignKeys: TableForeignKey[] = [];
+	const checks: TableCheck[] = [];
+	const primaryKeys: TablePrimaryKey[] = [];
+	const uniqueConstraints: TableUniqueConstraint[] = [];
+
+	for (const column of columns) {
+		const reference = column.config.references;
+		if (!reference) continue;
+		const target = reference.ref();
+		foreignKeys.push({
+			name: `${name}_${column.name}_fk`,
+			table: t,
+			columns: [column],
+			foreignTable: target.table as Table | undefined,
+			foreignColumns: [target],
+			onUpdate: reference.onUpdate,
+			onDelete: reference.onDelete,
+		});
+	}
+
+	for (const extra of extras) {
+		switch (extra.kind) {
+			case 'index':
+				indexes.push({
+					name: indexName(extra.meta, name),
+					table: t,
+					columns: extra.meta.columns,
+					unique: extra.meta.unique,
+					where: extra.meta.where,
+				});
+				break;
+			case 'primaryKey':
+				primaryKeys.push({ name: primaryKeyName(extra.meta, name), table: t, columns: extra.meta.columns });
+				break;
+			case 'unique':
+				uniqueConstraints.push({
+					name: uniqueConstraintName(extra.meta, name),
+					table: t,
+					columns: extra.meta.columns,
+				});
+				break;
+			case 'foreignKey':
+				foreignKeys.push({
+					name: foreignKeyName(extra.meta, name),
+					table: t,
+					columns: extra.meta.columns,
+					foreignTable: extra.meta.foreignColumns[0]?.table as Table | undefined,
+					foreignColumns: extra.meta.foreignColumns,
+					onUpdate: extra.meta.onUpdate,
+					onDelete: extra.meta.onDelete,
+				});
+				break;
+			case 'check':
+				checks.push({ name: extra.meta.name, table: t, value: extra.meta.value });
+				break;
+		}
+	}
+
+	return { name, schema: undefined, columns, indexes, foreignKeys, checks, primaryKeys, uniqueConstraints, extras };
+};
+
+/** Aliased reference to a table, for self-joins and disambiguation. */
+export function alias<T extends Table, TName extends string>(
+	t: T,
+	aliasName: TName,
+): T extends Table<infer C> ? Table<C, TName> : never {
+	const columns: ColumnsMap = {};
+	for (const [key, column] of Object.entries(getTableColumns(t))) {
+		columns[key] = column.withTable(aliasName);
+	}
+	return buildTable(aliasName, getTableOriginalName(t), columns, getTableExtras(t), true) as any;
+}
+
+export const isAliased = (t: Table): boolean => t[TableName] !== t[TableOriginalName];
+
+/**
+ * A subquery behaves exactly like a table everywhere except the `from` clause,
+ * so it is represented as one — with the inner statement hung off a symbol.
+ */
+export const TableSource = Symbol.for('d1zzle:TableSource');
+
+export type Subquery<TColumns extends ColumnsMap = ColumnsMap, TName extends string = string> =
+	& Table<TColumns, TName>
+	& {
+	readonly [TableSource]: SQLChunk;
+};
+
+export const createSubquery = <TColumns extends ColumnsMap, TName extends string>(
+	aliasName: TName,
+	source: SQLChunk,
+	columns: TColumns,
+): Subquery<TColumns, TName> => {
+	const t = buildTable(aliasName, aliasName, columns, []);
+	return Object.assign(t, { [TableSource]: source }) as unknown as Subquery<TColumns, TName>;
+};
+
+export const getTableSource = (t: Table): SQLChunk | undefined =>
+	(t as Partial<Subquery>)[TableSource];

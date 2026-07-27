@@ -1,0 +1,69 @@
+/**
+ * `d1zzle/sqlite-core` — the Drizzle-named surface a schema file uses.
+ *
+ * This entry exists so an existing project can migrate with **zero diff**, by
+ * aliasing the module specifier instead of editing imports:
+ *
+ * ```jsonc
+ * // tsconfig.json
+ * "baseUrl": ".",
+ * "paths": {
+ *   "drizzle-orm":             ["./node_modules/d1zzle/dist/index.js"],
+ *   "drizzle-orm/sqlite-core": ["./node_modules/d1zzle/dist/sqlite-core.js"]
+ * }
+ * ```
+ *
+ * The mapping must point at the **`.js`**, and `baseUrl` must be set. Both are
+ * load-bearing and both fail silently: esbuild cannot bundle a `.d.ts` target
+ * and ignores a bare path with no `baseUrl`, so in either case it falls through
+ * to node resolution and bundles the real `drizzle-orm` — which is present by
+ * definition for anyone following this recipe. The result typechecks against
+ * d1zzle and runs on Drizzle. `test/unit/module-resolution.test.ts` pins it.
+ *
+ * Everything here is a re-export of the native API under Drizzle's names, so
+ * the two entry points cannot drift.
+ */
+export {
+	alias,
+	blob,
+	check,
+	Column,
+	ColumnBuilder,
+	customType,
+	foreignKey,
+	getTableColumns,
+	getTableConfig,
+	getTableName,
+	index,
+	integer,
+	numeric,
+	primaryKey,
+	real,
+	sqliteTable,
+	table,
+	text,
+	unique,
+	uniqueIndex,
+} from './index.js';
+
+export type {
+	BlobConfig,
+	ColumnConfig,
+	ColumnMeta,
+	InferInsert,
+	InferInsertModel,
+	InferSelect,
+	InferSelectModel,
+	IntegerConfig,
+	ReferentialAction,
+	SQLiteType,
+	Table,
+	TableConfig,
+	TextConfig,
+} from './index.js';
+
+/**
+ * Drizzle exposes the D1 driver from `drizzle-orm/d1`; d1zzle's `drizzle()`
+ * lives on the root entry and is re-exported here for convenience.
+ */
+export { d1zzle, drizzle } from './index.js';

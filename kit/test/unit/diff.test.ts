@@ -1,0 +1,859 @@
+import { check, foreignKey, index, integer, primaryKey, sql, sqliteTable, text, unique, uniqueIndex } from 'd1zzle';
+import type { Column } from 'd1zzle';
+import { describe, expect, it } from 'vitest';
+import { diffSnapshots, renderMigration } from '../../src/core/diff.js';
+import { applicableStatements } from '../../src/core/sql.js';
+import { hasAutoincrement, parseChecks, parseGenerated } from '../../src/core/introspect.js';
+import { assertRoundTrip, emptySnapshot, snapshotFromSchema } from '../../src/core/snapshot.js';
+import type { Snapshot } from '../../src/core/snapshot.js';
+
+const indexOn = (name: string, column: Column<any>) => index(name).on(column);
+
+const snapshotOf = (...tables: Parameters<typeof snapshotFromSchema>[0] extends infer _ ? any[] : never): Snapshot =>
+	snapshotFromSchema(tables);
+
+describe('parsing a CREATE TABLE', () => {
+	it('reads a generated expression containing parentheses, and the mode after it', () => {
+		const sql = 'create table "t" ("name" text, "shout" text generated always as (upper("name")) stored)';
+
+		// `[^)]*` stopped at the first `)`, so the expression came back truncated
+		// and the trailing `stored` was never seen — silently downgrading it to
+		// virtual, which is a different column.
+		expect(parseGenerated(sql, 'shout')).toEqual({ as: 'upper("name")', mode: 'stored' });
+	});
+
+	it('defaults to virtual when no storage is written, as SQLite does', () => {
+		const sql = 'create table "t" ("a" integer, "b" integer generated always as ("a" + 1))';
+		expect(parseGenerated(sql, 'b')).toEqual({ as: '"a" + 1', mode: 'virtual' });
+	});
+
+	it('treats a column name as data, not as a pattern', () => {
+		// `a(` is a legal SQLite identifier and used to throw "Unterminated group".
+		const sql = 'create table "t" ("a(" integer primary key autoincrement)';
+		expect(() => hasAutoincrement(sql, 'a(')).not.toThrow();
+		expect(hasAutoincrement(sql, 'a(')).toBe(true);
+		expect(parseGenerated(sql, 'a(')).toBeUndefined();
+	});
+});
+
+describe('diffing snapshots', () => {
+	it('creates a table and its indexes from nothing', () => {
+		const t = sqliteTable('users', {
+			id: integer('id').primaryKey(),
+			email: text('email').notNull(),
+		}, (c) => [uniqueIndex('users_email_idx').on(c.email)]);
+
+		const { statements, errors } = diffSnapshots(emptySnapshot(), snapshotOf(t));
+
+		expect(errors).toEqual([]);
+		expect(statements.map((s) => s.sql)).toEqual([
+			'create table "users" (\n\t"id" integer primary key not null,\n\t"email" text not null\n)',
+			'create unique index "users_email_idx" on "users" ("email")',
+		]);
+		expect(statements.every((s) => !s.destructive)).toBe(true);
+	});
+
+	it('drops a removed table, and marks it destructive', () => {
+		const t = sqliteTable('gone', { id: integer('id').primaryKey() });
+		const { statements } = diffSnapshots(snapshotOf(t), emptySnapshot());
+
+		expect(statements).toEqual([{
+			sql: 'drop table "gone"',
+			destructive: true,
+			reason: 'table "gone" was removed from the schema',
+		}]);
+	});
+
+	it('drops tables children first, the reverse of creation order', () => {
+		const parent = sqliteTable('parent', { id: integer('id').primaryKey() });
+		const child = sqliteTable('child', {
+			id: integer('id').primaryKey(),
+			parentId: integer('parent_id').references(() => parent.id),
+		});
+
+		// Declared parent-first, so the naive order would drop it while the
+		// child's foreign key still points at it — which D1 enforces.
+		const { statements } = diffSnapshots(snapshotOf(parent, child), emptySnapshot());
+
+		expect(statements.map((s) => s.sql)).toEqual(['drop table "child"', 'drop table "parent"']);
+	});
+
+	it('refuses to drop a table a surviving one still references', () => {
+		const parent = sqliteTable('parent', { id: integer('id').primaryKey() });
+		const child = sqliteTable('child', {
+			id: integer('id').primaryKey(),
+			parentId: integer('parent_id').references(() => parent.id),
+		});
+
+		// `child` stays, `parent` goes. Ordering the drops cannot help here, and
+		// D1 enforces the foreign key — the statement would fail on apply and
+		// take the whole atomic migration with it.
+		const { statements, errors } = diffSnapshots(snapshotOf(parent, child), snapshotOf(child));
+
+		expect(statements.map((s) => s.sql)).not.toContain('drop table "parent"');
+		expect(errors).toHaveLength(1);
+		expect(errors[0]).toMatch(/"child" still references it/);
+	});
+
+	it('adds a nullable column in place', () => {
+		const before = sqliteTable('users', { id: integer('id').primaryKey() });
+		const after = sqliteTable('users', {
+			id: integer('id').primaryKey(),
+			name: text('name'),
+		});
+
+		expect(diffSnapshots(snapshotOf(before), snapshotOf(after)).statements.map((s) => s.sql))
+			.toEqual(['alter table "users" add column "name" text']);
+	});
+
+	it('adds a NOT NULL column with a default in place', () => {
+		const before = sqliteTable('users', { id: integer('id').primaryKey() });
+		const after = sqliteTable('users', {
+			id: integer('id').primaryKey(),
+			role: text('role').notNull().default('member'),
+		});
+
+		expect(diffSnapshots(snapshotOf(before), snapshotOf(after)).statements.map((s) => s.sql))
+			.toEqual([`alter table "users" add column "role" text not null default 'member'`]);
+	});
+
+	it('refuses a NOT NULL column with no default, rather than emitting SQL that fails on apply', () => {
+		const before = sqliteTable('users', { id: integer('id').primaryKey() });
+		const after = sqliteTable('users', {
+			id: integer('id').primaryKey(),
+			role: text('role').notNull(),
+		});
+
+		const { errors } = diffSnapshots(snapshotOf(before), snapshotOf(after));
+		expect(errors).toHaveLength(1);
+		expect(errors[0]).toMatch(/cannot be backfilled/);
+	});
+
+	it('recreates rather than ALTERing for a non-constant default, which ADD COLUMN rejects', () => {
+		const before = sqliteTable('events', { id: integer('id').primaryKey() });
+		const after = sqliteTable('events', {
+			id: integer('id').primaryKey(),
+			at: integer('at').default(sql`(unixepoch())`),
+		});
+
+		const { statements, errors } = diffSnapshots(snapshotOf(before), snapshotOf(after));
+		expect(errors).toEqual([]);
+		expect(statements.map((s) => s.sql)).not.toContain(
+			`alter table "events" add column "at" integer default (unixepoch())`,
+		);
+		expect(statements.some((s) => s.sql.startsWith('create table'))).toBe(true);
+	});
+
+	it('normalises a bare expression default, so it is not mistaken for a constant', () => {
+		// `sql`unixepoch()`` — the spelling `pull` used to hand back — reached
+		// the snapshot bare, and "does it start with `(`" is how ADD COLUMN's
+		// constant check works: the guard was defeated by exactly the input it
+		// exists to catch, and emitted `add column … default unixepoch()`,
+		// which SQLite rejects.
+		const before = sqliteTable('events', { id: integer('id').primaryKey() });
+		const after = sqliteTable('events', {
+			id: integer('id').primaryKey(),
+			at: integer('at').default(sql`unixepoch()`),
+		});
+
+		expect(snapshotOf(after).tables.events!.columns.at!.default).toBe('(unixepoch())');
+
+		const { statements, errors } = diffSnapshots(snapshotOf(before), snapshotOf(after));
+		expect(errors).toEqual([]);
+		expect(statements.every((s) => !s.sql.includes('add column'))).toBe(true);
+		expect(statements.some((s) => s.sql.includes('default (unixepoch())'))).toBe(true);
+	});
+
+	it('treats an expression default as equal to itself with the parens stripped', () => {
+		// CREATE TABLE requires `default (unixepoch())`; `pragma table_info`
+		// reports it as `unixepoch()`. The only legal spelling was the one that
+		// could not compare equal to itself, so the standard D1 timestamp idiom
+		// rebuilt its table destructively on every check and push.
+		const schemaSide = snapshotOf(sqliteTable('t', {
+			id: integer('id').primaryKey(),
+			at: integer('at').default(sql`(unixepoch())`),
+		}));
+		const liveSide: Snapshot = {
+			...schemaSide,
+			origin: 'introspection',
+			tables: {
+				t: {
+					...schemaSide.tables['t']!,
+					columns: {
+						...schemaSide.tables['t']!.columns,
+						at: { ...schemaSide.tables['t']!.columns['at']!, default: 'unixepoch()' },
+					},
+				},
+			},
+		};
+
+		expect(diffSnapshots(liveSide, schemaSide).statements).toEqual([]);
+	});
+
+	it('does not rebuild for a single-column table-level primary key', () => {
+		// SQLite reports a lone primary key as NOT NULL whether or not it was
+		// written that way, so the table-level spelling used to drift forever.
+		const inline = snapshotOf(sqliteTable('t', { id: integer('id').primaryKey() }));
+		const tableLevel = snapshotOf(
+			sqliteTable('t', { id: integer('id') }, (c) => [primaryKey({ columns: [c.id] })]),
+		);
+
+		expect(diffSnapshots(inline, tableLevel).statements).toEqual([]);
+	});
+
+	it('never names a generated column in the rebuild it writes', () => {
+		const from = sqliteTable('t', {
+			id: integer('id').primaryKey(),
+			name: text('name'),
+			shout: text('shout').generatedAlwaysAs(sql`upper("name")`, { mode: 'stored' }),
+		});
+		// Any change at all forces the rebuild; SQLite rejects an INSERT that
+		// names a generated column, and the batch is atomic, so the whole
+		// migration rolled back.
+		const to = sqliteTable('t', {
+			id: integer('id').primaryKey(),
+			name: text('name').notNull().default(''),
+			shout: text('shout').generatedAlwaysAs(sql`upper("name")`, { mode: 'stored' }),
+		});
+
+		const insert = diffSnapshots(snapshotOf(from), snapshotOf(to))
+			.statements.find((s) => s.sql.startsWith('insert into'))!;
+
+		expect(insert.sql).toBe('insert into "__new_t" ("id", "name") select "id", "name" from "t"');
+	});
+
+	it('drops an index before the column it indexes, not after', () => {
+		const before = sqliteTable('t', { id: integer('id').primaryKey(), gone: text('gone') }, (c) => [
+			indexOn('t_gone_idx', c.gone),
+		]);
+		const after = sqliteTable('t', { id: integer('id').primaryKey() });
+
+		// DROP COLUMN re-validates every surviving index, so the reverse order
+		// fails with "error in index t_gone_idx after drop column".
+		const sql = diffSnapshots(snapshotOf(before), snapshotOf(after)).statements.map((s) => s.sql);
+		expect(sql).toEqual(['drop index "t_gone_idx"', 'alter table "t" drop column "gone"']);
+	});
+
+	it('creates an index after the column it indexes', () => {
+		const before = sqliteTable('t', { id: integer('id').primaryKey() });
+		const after = sqliteTable('t', { id: integer('id').primaryKey(), added: text('added') }, (c) => [
+			indexOn('t_added_idx', c.added),
+		]);
+
+		const sql = diffSnapshots(snapshotOf(before), snapshotOf(after)).statements.map((s) => s.sql);
+		expect(sql).toEqual([
+			'alter table "t" add column "added" text',
+			'create index "t_added_idx" on "t" ("added")',
+		]);
+	});
+
+	describe('dropping a column something else still names', () => {
+		// Each of these emitted a bare `drop column` that SQLite rejects, because
+		// DROP COLUMN re-validates the whole surviving schema.
+		const rebuildsFor = (before: any, after: any) => {
+			const { statements, errors } = diffSnapshots(snapshotOf(before), snapshotOf(after));
+			expect(errors).toEqual([]);
+			return statements.map((s) => s.sql);
+		};
+
+		it('rebuilds when a generated expression names it', () => {
+			const before = sqliteTable('t', {
+				id: integer('id').primaryKey(),
+				email: text('email'),
+				domain: text('domain').generatedAlwaysAs(sql`upper("email")`, { mode: 'virtual' }),
+			});
+			const after = sqliteTable('t', {
+				id: integer('id').primaryKey(),
+				domain: text('domain').generatedAlwaysAs(sql`upper("email")`, { mode: 'virtual' }),
+			});
+
+			expect(rebuildsFor(before, after).some((s) => s.includes('__new_t'))).toBe(true);
+		});
+
+		it('rebuilds when a partial index predicate names it', () => {
+			const before = sqliteTable('t', {
+				id: integer('id').primaryKey(),
+				name: text('name'),
+				gone: integer('gone'),
+			}, (c) => [uniqueIndex('t_idx').on(c.name).where(sql`${c.gone} = 1`)]);
+			const after = sqliteTable('t', {
+				id: integer('id').primaryKey(),
+				name: text('name'),
+			}, (c) => [uniqueIndex('t_idx').on(c.name).where(sql`"gone" = 1`)]);
+
+			expect(rebuildsFor(before, after).some((s) => s.includes('__new_t'))).toBe(true);
+		});
+
+		it('rebuilds when a surviving check constraint names it', () => {
+			const before = sqliteTable('t', {
+				id: integer('id').primaryKey(),
+				gone: integer('gone'),
+			}, (c) => [check('t_chk', sql`${c.gone} >= 0`)]);
+			const after = sqliteTable('t', {
+				id: integer('id').primaryKey(),
+			}, () => [check('t_chk', sql`"gone" >= 0`)]);
+
+			expect(rebuildsFor(before, after).some((s) => s.includes('__new_t'))).toBe(true);
+		});
+
+		it('still drops in place when nothing else names it', () => {
+			const before = sqliteTable('t', { id: integer('id').primaryKey(), spare: text('spare') });
+			const after = sqliteTable('t', { id: integer('id').primaryKey() });
+
+			expect(diffSnapshots(snapshotOf(before), snapshotOf(after)).statements.map((s) => s.sql))
+				.toEqual(['alter table "t" drop column "spare"']);
+		});
+
+		it('is not fooled by a column name that is a prefix of another', () => {
+			const before = sqliteTable('t', {
+				id: integer('id').primaryKey(),
+				email: text('email'),
+				emailVerified: integer('email_verified'),
+			}, (c) => [check('t_chk', sql`${c.emailVerified} >= 0`)]);
+			const after = sqliteTable('t', {
+				id: integer('id').primaryKey(),
+				emailVerified: integer('email_verified'),
+			}, (c) => [check('t_chk', sql`${c.emailVerified} >= 0`)]);
+
+			// `email` is a substring of `email_verified`, but not a word in it.
+			expect(rebuildsFor(before, after)).toEqual(['alter table "t" drop column "email"']);
+		});
+	});
+
+	it('drops a removed column, and marks it destructive', () => {
+		const before = sqliteTable('users', { id: integer('id').primaryKey(), old: text('old') });
+		const after = sqliteTable('users', { id: integer('id').primaryKey() });
+
+		const { statements } = diffSnapshots(snapshotOf(before), snapshotOf(after));
+		expect(statements[0]).toMatchObject({
+			sql: 'alter table "users" drop column "old"',
+			destructive: true,
+		});
+	});
+
+	describe('table recreation', () => {
+		const before = sqliteTable('users', {
+			id: integer('id').primaryKey(),
+			email: text('email'),
+			age: text('age'),
+		});
+
+		it('rebuilds the table when a column changes type', () => {
+			const after = sqliteTable('users', {
+				id: integer('id').primaryKey(),
+				email: text('email'),
+				age: integer('age'),
+			});
+
+			const { statements } = diffSnapshots(snapshotOf(before), snapshotOf(after));
+			const sql = statements.map((s) => s.sql);
+
+			expect(sql[0]).toBe('PRAGMA defer_foreign_keys = ON');
+			expect(sql[1]).toContain('create table "__new_users"');
+			expect(sql[2]).toBe(
+				'insert into "__new_users" ("id", "email", "age") select "id", "email", "age" from "users"',
+			);
+			expect(sql[3]).toBe('drop table "users"');
+			expect(sql[4]).toBe('alter table "__new_users" rename to "users"');
+			// No closing pragma: it is scoped to the transaction that ran it.
+			expect(sql.some((s) => /foreign_keys\s*=\s*off/i.test(s))).toBe(false);
+		});
+
+		it('keeps the defer pragma in the statements that actually get applied', () => {
+			const after = sqliteTable('users', {
+				id: integer('id').primaryKey(),
+				email: text('email'),
+				age: integer('age'),
+			});
+
+			const { statements } = diffSnapshots(snapshotOf(before), snapshotOf(after));
+			// D1 will not let a migration turn `foreign_keys` off, so unlike every
+			// other pragma this one has to survive the applier's filter.
+			expect(applicableStatements(renderMigration({ statements, errors: [], warnings: [] }))[0])
+				.toBe('PRAGMA defer_foreign_keys = ON');
+		});
+
+		it('never selects *, and carries only the intersection of columns', () => {
+			const after = sqliteTable('users', {
+				id: integer('id').primaryKey(),
+				email: text('email').notNull().default(''),
+				added: text('added'),
+			});
+
+			const { statements } = diffSnapshots(snapshotOf(before), snapshotOf(after));
+			const insert = statements.find((s) => s.sql.startsWith('insert into'))!;
+
+			expect(insert.sql).toBe(
+				'insert into "__new_users" ("id", "email") select "id", "email" from "users"',
+			);
+			expect(statements.some((s) => s.sql.includes('select *'))).toBe(false);
+		});
+
+		it('recreates the indexes it dropped with the table', () => {
+			const withIndex = sqliteTable('users', {
+				id: integer('id').primaryKey(),
+				email: text('email').notNull(),
+			}, (c) => [uniqueIndex('users_email_idx').on(c.email)]);
+
+			const { statements } = diffSnapshots(snapshotOf(before), snapshotOf(withIndex));
+			expect(statements.some((s) => s.sql === 'create unique index "users_email_idx" on "users" ("email")'))
+				.toBe(true);
+		});
+
+		it('refuses to rebuild a table whose children would cascade on the drop', () => {
+			const users = sqliteTable('users', { id: integer('id').primaryKey(), email: text('email') });
+			const scores = sqliteTable('scores', {
+				id: integer('id').primaryKey(),
+				userId: integer('user_id').references(() => users.id, { onDelete: 'cascade' }),
+			});
+
+			// A type change on users forces the recreate; dropping it would fire
+			// the cascade and empty `scores`, and D1 cannot disable that.
+			const rebuilt = sqliteTable('users', { id: integer('id').primaryKey(), email: integer('email') });
+
+			const { errors } = diffSnapshots(snapshotOf(users, scores), snapshotOf(rebuilt, scores));
+			expect(errors).toHaveLength(1);
+			expect(errors[0]).toMatch(/"scores"."user_id" \(on delete cascade\)/);
+			expect(errors[0]).toMatch(/cannot disable foreign keys/);
+		});
+
+		it('refuses just as firmly when the child has no referential action', () => {
+			const users = sqliteTable('users', { id: integer('id').primaryKey(), email: text('email') });
+			const scores = sqliteTable('scores', {
+				id: integer('id').primaryKey(),
+				userId: integer('user_id').references(() => users.id),
+			});
+			const rebuilt = sqliteTable('users', { id: integer('id').primaryKey(), email: integer('email') });
+
+			// This used to be allowed. `DROP TABLE` runs an implicit `DELETE FROM`,
+			// which increments the deferred violation counter once per child row;
+			// the rename restores the schema but never decrements it, so the batch
+			// fails with FOREIGN KEY constraint failed — but only when the child
+			// holds rows, which is why an empty fixture never caught it.
+			const { errors, statements } = diffSnapshots(snapshotOf(users, scores), snapshotOf(rebuilt, scores));
+			expect(errors).toHaveLength(1);
+			expect(errors[0]).toMatch(/"scores"."user_id" \(on delete no action\)/);
+			expect(statements.some((s) => s.sql === 'drop table "users"')).toBe(false);
+		});
+
+		it('refuses a self-referencing table too', () => {
+			const nodes = sqliteTable('nodes', {
+				id: integer('id').primaryKey(),
+				parentId: integer('parent_id'),
+				label: text('label'),
+			}, (t) => [foreignKey({ columns: [t.parentId], foreignColumns: [t.id] })]);
+			const rebuilt = sqliteTable('nodes', {
+				id: integer('id').primaryKey(),
+				parentId: integer('parent_id'),
+				label: integer('label'),
+			}, (t) => [foreignKey({ columns: [t.parentId], foreignColumns: [t.id] })]);
+
+			const { errors } = diffSnapshots(snapshotOf(nodes), snapshotOf(rebuilt));
+			expect(errors).toHaveLength(1);
+			expect(errors[0]).toMatch(/"nodes"."parent_id"/);
+		});
+
+		it('says specifically what changed, since the reason becomes the migration comment', () => {
+			const typed = sqliteTable('users', { id: integer('id').primaryKey(), age: integer('age') });
+			const nullable = sqliteTable('users', {
+				id: integer('id').primaryKey(),
+				email: text('email').notNull(),
+				age: text('age'),
+			});
+
+			const reasonFor = (after: any) =>
+				diffSnapshots(snapshotOf(before), snapshotOf(after)).statements.find((s) => s.reason)?.reason;
+
+			expect(reasonFor(typed)).toMatch(/column "age" changes type/);
+			expect(reasonFor(nullable)).toMatch(/column "email" changes nullability/);
+		});
+
+		it('warns rather than migrates when only a constraint name changed', () => {
+			const from = sqliteTable('t', { id: integer('id').primaryKey(), a: integer('a') }, (c) => [
+				unique('old_name').on(c.a),
+			]);
+			const to = sqliteTable('t', { id: integer('id').primaryKey(), a: integer('a') }, (c) => [
+				unique('new_name').on(c.a),
+			]);
+
+			const { statements, warnings } = diffSnapshots(snapshotOf(from), snapshotOf(to));
+			expect(statements).toEqual([]);
+			expect(warnings[0]).toMatch(/"old_name" was renamed/);
+		});
+
+		it('emits nothing after the rebuild that would target the dropped table', () => {
+			const from = sqliteTable('users', { id: integer('id').primaryKey(), old: text('old') });
+			// Adding a unique column forces the rebuild; dropping `old` used to be
+			// emitted after it as `alter table "users" drop column "old"`, which
+			// fails with "no such column" and rolls the whole batch back.
+			const to = sqliteTable('users', {
+				id: integer('id').primaryKey(),
+				handle: text('handle').unique(),
+			});
+
+			const { statements } = diffSnapshots(snapshotOf(from), snapshotOf(to));
+			const sql = statements.map((s) => s.sql);
+
+			expect(sql.some((s) => s.includes('__new_users'))).toBe(true);
+			expect(sql.filter((s) => s.startsWith('alter table'))).toEqual([
+				'alter table "__new_users" rename to "users"',
+			]);
+			// The rebuild already carries the surviving columns across.
+			expect(sql.some((s) => s.includes('drop column'))).toBe(false);
+		});
+
+		it('rebuilds when nullability or a default changes', () => {
+			const notNull = sqliteTable('users', {
+				id: integer('id').primaryKey(),
+				email: text('email').notNull().default(''),
+				age: text('age'),
+			});
+
+			const { statements } = diffSnapshots(snapshotOf(before), snapshotOf(notNull));
+			expect(statements.some((s) => s.sql.includes('__new_users'))).toBe(true);
+		});
+	});
+
+	it('applies explicit renames instead of dropping and recreating', () => {
+		const before = sqliteTable('users', { id: integer('id').primaryKey(), name: text('name') });
+		const after = sqliteTable('people', { id: integer('id').primaryKey(), fullName: text('full_name') });
+
+		const { statements } = diffSnapshots(snapshotOf(before), snapshotOf(after), {
+			renamedTables: { users: 'people' },
+			renamedColumns: { 'people.name': 'full_name' },
+		});
+
+		expect(statements.map((s) => s.sql)).toEqual([
+			'alter table "users" rename to "people"',
+			'alter table "people" rename column "name" to "full_name"',
+		]);
+	});
+
+	it('leaves the rename to the rebuild when the table is also recreated', () => {
+		// A standalone `rename column` emitted before the rebuild renames the
+		// column out from under the rebuild's `INSERT … SELECT`, which still
+		// reads the old name. D1 has double-quoted-string-literal fallback on,
+		// so the unresolvable `"nick"` becomes the *string* `'nick'` rather than
+		// an error: the migration reports success and every value in the column
+		// is replaced by the old column's name.
+		const before = sqliteTable('zzp', {
+			id: integer('id').primaryKey(),
+			nick: text('nick'),
+			age: integer('age'),
+		});
+		// `age` changes type, which forces the rebuild.
+		const after = sqliteTable('zzp', {
+			id: integer('id').primaryKey(),
+			handle: text('handle'),
+			age: text('age'),
+		});
+
+		const sql = diffSnapshots(snapshotOf(before), snapshotOf(after), {
+			renamedColumns: { 'zzp.nick': 'handle' },
+		}).statements.map((s) => s.sql);
+
+		expect(sql.some((s) => s.includes('rename column'))).toBe(false);
+		// The rebuild carries the rename itself: old name on the right, new on
+		// the left, both resolvable at the point the INSERT runs.
+		expect(sql.some((s) => s.includes('"handle"') && s.includes('select') && s.includes('"nick"'))).toBe(true);
+	});
+
+	it('still emits the rename ALTER when the table survives in place', () => {
+		const before = sqliteTable('zzp', { id: integer('id').primaryKey(), nick: text('nick') });
+		const after = sqliteTable('zzp', { id: integer('id').primaryKey(), handle: text('handle') });
+
+		expect(
+			diffSnapshots(snapshotOf(before), snapshotOf(after), { renamedColumns: { 'zzp.nick': 'handle' } })
+				.statements.map((s) => s.sql),
+		).toEqual(['alter table "zzp" rename column "nick" to "handle"']);
+	});
+
+	it('adds and drops indexes without touching the table', () => {
+		const before = sqliteTable('users', { id: integer('id').primaryKey(), email: text('email') }, (c) => [
+			uniqueIndex('old_idx').on(c.email),
+		]);
+		const after = sqliteTable('users', { id: integer('id').primaryKey(), email: text('email') }, (c) => [
+			uniqueIndex('new_idx').on(c.email),
+		]);
+
+		expect(diffSnapshots(snapshotOf(before), snapshotOf(after)).statements.map((s) => s.sql)).toEqual([
+			'drop index "old_idx"',
+			'create unique index "new_idx" on "users" ("email")',
+		]);
+	});
+
+	it('produces nothing when the schema has not changed', () => {
+		const t = sqliteTable('users', { id: integer('id').primaryKey(), email: text('email') });
+		expect(diffSnapshots(snapshotOf(t), snapshotOf(t)).statements).toEqual([]);
+	});
+
+	it('renders a migration with a comment for every destructive step', () => {
+		const before = sqliteTable('users', { id: integer('id').primaryKey(), old: text('old') });
+		const after = sqliteTable('users', { id: integer('id').primaryKey() });
+
+		expect(renderMigration(diffSnapshots(snapshotOf(before), snapshotOf(after)))).toBe(
+			'-- column "users"."old" was removed from the schema\n'
+				+ 'alter table "users" drop column "old";',
+		);
+	});
+});
+
+describe('parsing checks', () => {
+	it('recovers an unnamed inline check', () => {
+		// SQLite makes `constraint <name>` optional, and a hand-written database
+		// usually omits it. Requiring it dropped the constraint silently, and the
+		// next rebuild left it out of the new table.
+		const sql = 'create table "t" ("a" integer, check ("a" >= 0))';
+		expect(Object.values(parseChecks(sql, 't'))).toEqual([{ name: 't_check_1', value: '"a" >= 0' }]);
+	});
+
+	it('keeps a declared name when there is one', () => {
+		const sql = 'create table "t" ("a" integer, constraint "t_a_chk" check ("a" >= 0))';
+		expect(Object.values(parseChecks(sql, 't'))).toEqual([{ name: 't_a_chk', value: '"a" >= 0' }]);
+	});
+
+	it('does not read a check out of a string literal', () => {
+		// A phantom constraint drifts against a table that matches its schema,
+		// and the rebuild carries the same default forward — so it never
+		// converges, destructively, on every run.
+		const sql = `create table "t" ("note" text default 'check(1 = 2)')`;
+		expect(parseChecks(sql, 't')).toEqual({});
+	});
+
+	it('still finds a real check whose expression contains a literal', () => {
+		const sql = `create table "t" ("a" text, check ("a" <> 'a (b)'))`;
+		expect(Object.values(parseChecks(sql, 't'))).toEqual([{ name: 't_check_1', value: `"a" <> 'a (b)'` }]);
+	});
+});
+
+describe('column-definition anchoring', () => {
+	it('does not match a column name inside another column default', () => {
+		// `hasAutoincrement` used to anchor on the bare name anywhere in the SQL,
+		// so a literal containing it stood in for the definition.
+		const sql = `create table "t" ("label" text default 'id integer primary key autoincrement', "id" integer)`;
+		expect(hasAutoincrement(sql, 'id')).toBe(false);
+	});
+
+	it('still finds the real definition', () => {
+		const sql = 'create table "t" ("id" integer primary key autoincrement, "b" text)';
+		expect(hasAutoincrement(sql, 'id')).toBe(true);
+	});
+});
+
+describe('rebuilding alongside the dependents that block it', () => {
+	const parent = (emailType: 'text' | 'integer') =>
+		emailType === 'text'
+			? sqliteTable('parent', { id: integer('id').primaryKey(), email: text('email') })
+			: sqliteTable('parent', { id: integer('id').primaryKey(), email: integer('email') });
+
+	it('allows the rebuild when the same migration drops the child', () => {
+		const child = sqliteTable('child', {
+			id: integer('id').primaryKey(),
+			pid: integer('pid').references(() => parent('text').id),
+		});
+
+		// The child is gone by the time the rebuild runs, so it is not a
+		// dependent — reading the before side refused this.
+		const { statements, errors } = diffSnapshots(
+			snapshotOf(parent('text'), child),
+			snapshotOf(parent('integer')),
+		);
+
+		expect(errors).toEqual([]);
+		expect(statements.some((s) => s.sql.includes('__new_parent'))).toBe(true);
+		expect(statements.findIndex((s) => s.sql === 'drop table "child"'))
+			.toBeLessThan(statements.findIndex((s) => s.sql.includes('__new_parent')));
+	});
+
+	it('allows the rebuild when the same migration removes the foreign key', () => {
+		const withFk = sqliteTable('child', {
+			id: integer('id').primaryKey(),
+			pid: integer('pid').references(() => parent('text').id),
+		});
+		const withoutFk = sqliteTable('child', {
+			id: integer('id').primaryKey(),
+			pid: integer('pid'),
+		});
+
+		// This is exactly what the error message tells you to do, and it used to
+		// be refused anyway because the guard read the pre-migration snapshot.
+		const { statements, errors } = diffSnapshots(
+			snapshotOf(parent('text'), withFk),
+			snapshotOf(parent('integer'), withoutFk),
+		);
+
+		expect(errors).toEqual([]);
+		// The child sheds its foreign key before the parent is dropped.
+		expect(statements.findIndex((s) => s.sql.includes('__new_child')))
+			.toBeLessThan(statements.findIndex((s) => s.sql.includes('__new_parent')));
+	});
+
+	it('still refuses when the child keeps its foreign key', () => {
+		const child = sqliteTable('child', {
+			id: integer('id').primaryKey(),
+			pid: integer('pid').references(() => parent('text').id),
+		});
+
+		const { errors } = diffSnapshots(
+			snapshotOf(parent('text'), child),
+			snapshotOf(parent('integer'), child),
+		);
+		expect(errors).toHaveLength(1);
+	});
+
+	it('does not count a column named only inside a string literal', () => {
+		const before = sqliteTable('t', {
+			id: integer('id').primaryKey(),
+			keep: text('keep'),
+			gone: text('gone'),
+		}, (c) => [check('t_chk', sql`${c.keep} <> 'gone'`)]);
+		const after = sqliteTable('t', {
+			id: integer('id').primaryKey(),
+			keep: text('keep'),
+		}, (c) => [check('t_chk', sql`${c.keep} <> 'gone'`)]);
+
+		// `'gone'` is a value, not the column. Treating it as a reference forced
+		// an unnecessary destructive rebuild.
+		expect(diffSnapshots(snapshotOf(before), snapshotOf(after)).statements.map((s) => s.sql))
+			.toEqual(['alter table "t" drop column "gone"']);
+	});
+});
+
+describe('rebuild ordering does not depend on declaration order', () => {
+	const build = (parentType: 'text' | 'integer', withFk: boolean) => {
+		const parent = parentType === 'text'
+			? sqliteTable('parent', { id: integer('id').primaryKey(), v: text('v') })
+			: sqliteTable('parent', { id: integer('id').primaryKey(), v: integer('v') });
+		const child = withFk
+			? sqliteTable('child', {
+				id: integer('id').primaryKey(),
+				pid: integer('pid').references(() => parent.id),
+			})
+			: sqliteTable('child', { id: integer('id').primaryKey(), pid: integer('pid') });
+		return { parent, child };
+	};
+
+	const orderOf = (declaredChildFirst: boolean) => {
+		const from = build('text', true);
+		const to = build('integer', false);
+
+		// The edge that decides the order is the one this migration removes, so
+		// ordering by the `after` graph found no edges at all and fell back to
+		// declaration order — which is right only by luck.
+		const { statements, errors } = diffSnapshots(
+			snapshotOf(...(declaredChildFirst ? [from.child, from.parent] : [from.parent, from.child])),
+			snapshotOf(...(declaredChildFirst ? [to.child, to.parent] : [to.parent, to.child])),
+		);
+		expect(errors).toEqual([]);
+
+		const sql = statements.map((s) => s.sql);
+		return {
+			child: sql.findIndex((s) => s.includes('__new_child')),
+			parent: sql.findIndex((s) => s.includes('__new_parent')),
+		};
+	};
+
+	it('rebuilds the child first when the parent is declared first', () => {
+		const { child, parent } = orderOf(false);
+		expect(child).toBeGreaterThanOrEqual(0);
+		expect(child).toBeLessThan(parent);
+	});
+
+	it('rebuilds the child first when the child is declared first', () => {
+		const { child, parent } = orderOf(true);
+		expect(child).toBeGreaterThanOrEqual(0);
+		expect(child).toBeLessThan(parent);
+	});
+
+	it('orders a three-level chain leaf-first regardless of declaration', () => {
+		const mk = (grandchildType: 'text' | 'integer') => {
+			const a = sqliteTable('a', { id: integer('id').primaryKey() });
+			const b = sqliteTable('b', {
+				id: integer('id').primaryKey(),
+				aid: integer('aid').references(() => a.id),
+			});
+			const c = grandchildType === 'text'
+				? sqliteTable('c', {
+					id: integer('id').primaryKey(),
+					v: text('v'),
+					bid: integer('bid').references(() => b.id),
+				})
+				: sqliteTable('c', { id: integer('id').primaryKey(), v: integer('v'), bid: integer('bid') });
+			return { a, b, c };
+		};
+
+		const from = mk('text');
+		const to = mk('integer');
+		// Declared leaf-first, the order that used to come out backwards.
+		const { statements, errors } = diffSnapshots(
+			snapshotOf(from.c, from.b, from.a),
+			snapshotOf(to.c, to.b, to.a),
+		);
+
+		expect(errors).toEqual([]);
+		const sql = statements.map((s) => s.sql);
+		expect(sql.findIndex((s) => s.includes('__new_c'))).toBeGreaterThanOrEqual(0);
+	});
+});
+
+/**
+ * The invariant `assertRoundTrip` exists to state: a snapshot has to reproduce
+ * exactly what the DDL generator emits directly. It had no caller at all, which
+ * on an unpublished package means it was asserting nothing.
+ *
+ * It is the property the whole kit rests on — `generate` renders migrations
+ * from snapshots, so a snapshot that loses a constraint writes a migration that
+ * drops it — and it is cheap enough to run over every shape the fixtures cover.
+ */
+describe('snapshot and DDL agree, table for table', () => {
+	const parents = sqliteTable('p_parent', { id: integer('id').primaryKey() });
+	const others = sqliteTable('p_other', { id: integer('id').primaryKey() });
+
+	const fixtures = {
+		'a plain table': sqliteTable('plain', { id: integer('id').primaryKey(), name: text('name') }),
+		'autoincrement': sqliteTable('ai', { id: integer('id').primaryKey({ autoIncrement: true }) }),
+		'not null and defaults': sqliteTable('nd', {
+			id: integer('id').primaryKey(),
+			name: text('name').notNull().default('anon'),
+			count: integer('count').notNull().default(0),
+		}),
+		'a column-level unique': sqliteTable('cu', {
+			id: integer('id').primaryKey(),
+			email: text('email').notNull().unique(),
+		}),
+		'a composite primary key': sqliteTable('cpk', {
+			a: integer('a').notNull(),
+			b: text('b').notNull(),
+		}, (t) => [primaryKey({ columns: [t.a, t.b] })]),
+		'a table-level unique': sqliteTable('tu', {
+			a: integer('a').notNull(),
+			b: text('b').notNull(),
+		}, (t) => [unique('tu_ab').on(t.a, t.b)]),
+		'a check constraint': sqliteTable('ck', {
+			id: integer('id').primaryKey(),
+			n: integer('n'),
+		}, (t) => [check('ck_n', sql`${t.n} >= 0`)]),
+		// Two unnamed table-level keys used to derive the same `${table}_fk`
+		// name, so the snapshot's record kept only the second — a referential
+		// constraint dropped from the generated migration with no warning, and
+		// invisible to the ordering and drop guards that read the same record.
+		'two unnamed table-level foreign keys': sqliteTable('p_child', {
+			parentId: integer('parent_id').notNull(),
+			otherId: integer('other_id').notNull(),
+		}, (t) => [
+			foreignKey({ columns: [t.parentId], foreignColumns: [parents.id] }),
+			foreignKey({ columns: [t.otherId], foreignColumns: [others.id] }),
+		]),
+		'a generated column': sqliteTable('gen', {
+			id: integer('id').primaryKey(),
+			name: text('name').notNull(),
+			shout: text('shout').generatedAlwaysAs(sql`upper("name")`, { mode: 'stored' }),
+		}),
+	};
+
+	for (const [description, table] of Object.entries(fixtures)) {
+		it(`round-trips ${description}`, () => {
+			expect(() => assertRoundTrip(table)).not.toThrow();
+		});
+	}
+});

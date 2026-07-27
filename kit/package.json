@@ -1,0 +1,42 @@
+{
+	"name": "d1zzle-kit",
+	"version": "0.1.0",
+	"description": "Migrations, introspection and drift detection for d1zzle on Cloudflare D1.",
+	"type": "module",
+	"license": "MIT",
+	"engines": {
+		"node": ">=22.13"
+	},
+	"bin": {
+		"d1zzle-kit": "./dist/cli.js"
+	},
+	"exports": {
+		".": {
+			"types": "./dist/index.d.ts",
+			"default": "./dist/index.js"
+		},
+		"./core": {
+			"types": "./dist/core/index.d.ts",
+			"default": "./dist/core/index.js"
+		}
+	},
+	"files": [
+		"dist",
+		"README.md",
+		"LICENSE"
+	],
+	"peerDependencies": {
+		"d1zzle": "^0.1.0"
+	},
+	"dependencies": {},
+	"devDependencies": {
+		"@typescript/native-preview": "7.0.0-dev.20260707.2"
+	},
+	"scripts": {
+		"build": "tsgo --project tsconfig.build.json",
+		"prepublishOnly": "npm run build"
+	},
+	"publishConfig": {
+		"access": "public"
+	}
+}
