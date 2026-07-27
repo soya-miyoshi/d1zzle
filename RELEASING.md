@@ -32,9 +32,14 @@ CI (`.github/workflows/ci.yml`) runs on every push and PR from that point on.
 
 ### 2. Bootstrap each package with a manual publish
 
-npm attaches a trusted publisher to a package that **already exists**, so the first publish
-of each name is done by hand. Both names were unclaimed as of 2026-07-27; that is worth
-re-checking before you rely on it.
+Trusted publishing cannot bootstrap itself: `npm trust` states plainly that "the package
+you're configuring must already exist on the npm registry". So the first publish of each
+name is done by hand, once, and every release after that is automated. Both names were
+unclaimed as of 2026-07-27; worth re-checking before you rely on it.
+
+The repository must be **public** for this to work end to end — provenance attestations
+require it, and because npm generates them automatically for OIDC publishes, a private repo
+fails the publish rather than quietly skipping the attestation.
 
 ```bash
 npm login
@@ -52,12 +57,24 @@ before the dependent lands.
 
 ### 3. Configure the trusted publisher
 
-On npmjs.com, for **each** package:
+Once both names exist on the registry, from the CLI:
 
-> Package → Settings → Trusted Publisher → GitHub Actions
-> - Organization / repository: `<owner>/d1zzle`
-> - Workflow filename: `release.yml`
-> - Environment: *(leave empty)*
+```bash
+npm trust github d1zzle     --repo <owner>/d1zzle --file release.yml --allow-publish
+npm trust github d1zzle-kit --repo <owner>/d1zzle --file release.yml --allow-publish
+
+npm trust list d1zzle       # verify
+npm trust list d1zzle-kit
+```
+
+`--allow-publish` is **required**, not optional: trusted-publisher configurations created
+after 2026-05-20 must name at least one allowed action, and a configuration created without
+one authorises nothing. (Older configurations were implicitly publish-only, which is why
+guides written before that date omit the flag.)
+
+`--file` is the workflow *filename*, not a path — it must match `release.yml` exactly. Both
+packages point at the same repository and the same workflow, which is what lockstep means
+here. The equivalent UI is Package → Settings → Trusted Publisher on npmjs.com.
 
 After this, every later release is automated and no token is involved.
 
