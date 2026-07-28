@@ -610,6 +610,8 @@ describe('many-to-many through a junction table', () => {
 	}));
 
 	const m2mDb = drizzle({ client: DB, relations: m2m });
+	const m2mJoined = drizzle({ client: DB, relations: m2m, relationalStrategy: 'joined' });
+
 
 	beforeEach(async () => {
 		for (const name of ['article_tags', 'tags', 'articles']) {
@@ -634,6 +636,30 @@ describe('many-to-many through a junction table', () => {
 		});
 
 		expect(rows).toEqual([
+			{ id: 1, tags: [{ label: 'd1' }, { label: 'sql' }] },
+			{ id: 2, tags: [{ label: 'sql' }] },
+		]);
+	});
+
+	it('falls back to the split plan for a junction, rather than emitting wrong SQL', async () => {
+		// The joined builder does not emit the join a `through` relation needs,
+		// so it must degrade to the split plan silently — same rows, more
+		// statements. Emitting a correlated subquery without the junction would
+		// return plausible-looking but wrong tags, which is the failure this
+		// pins.
+		const config = {
+			columns: { id: true },
+			with: { tags: { columns: { label: true }, orderBy: { label: 'asc' } } },
+			orderBy: { id: 'asc' },
+		} as const;
+
+		const [split, one] = await Promise.all([
+			m2mDb.query.articles.findMany(config),
+			m2mJoined.query.articles.findMany(config),
+		]);
+
+		expect(one).toEqual(split);
+		expect(one).toEqual([
 			{ id: 1, tags: [{ label: 'd1' }, { label: 'sql' }] },
 			{ id: 2, tags: [{ label: 'sql' }] },
 		]);
@@ -676,5 +702,131 @@ describe('many-to-many through a junction table', () => {
 			where: { tags: { label: 'd1' } },
 		});
 		expect(rows).toEqual([{ id: 1 }]);
+	});
+});
+
+/**
+ * The two relational plans must be indistinguishable from the outside.
+ *
+ * `relationalStrategy: 'joined'` answers a `with` in one statement — correlated
+ * subqueries wrapped in `json_group_array` / `json_object` — instead of one
+ * query per level stitched in JS. That is a performance choice, so the results
+ * have to be *equal*, not merely similar: same keys, same order, and the same
+ * decoded values, since a relation's payload arrives as JSON text and never
+ * passes through a column's decoder on its own.
+ */
+describe('joined strategy', () => {
+	const joined = drizzle({ client: DB, relations: schema.relations, relationalStrategy: 'joined' });
+
+	const bothAgree = async (run: (d: typeof db) => Promise<unknown>) => {
+		const [split, one] = await Promise.all([run(db), run(joined)]);
+		expect(one).toEqual(split);
+		return one;
+	};
+
+	it('agrees with the split plan on a `many` relation', async () => {
+		const rows = await bothAgree((d) =>
+			d.query.users.findMany({ with: { posts: true }, orderBy: { id: 'asc' } })
+		) as { posts: unknown[] }[];
+
+		expect(rows).toHaveLength(2);
+		expect(rows[0]!.posts).toHaveLength(2);
+	});
+
+	it('agrees on a `one` relation', async () => {
+		await bothAgree((d) => d.query.posts.findMany({ with: { author: true }, orderBy: { id: 'asc' } }));
+	});
+
+	it('returns [] rather than null for a parent with no children', async () => {
+		await db.delete(schema.posts).where(eq(schema.posts.authorId, 2));
+		const rows = await bothAgree((d) =>
+			d.query.users.findMany({ with: { posts: true }, orderBy: { id: 'asc' } })
+		) as { posts: unknown[] }[];
+
+		expect(rows[1]!.posts).toEqual([]);
+	});
+
+	it('decodes nested values, not just their shape', async () => {
+		// `createdAt` is a timestamp column: through JSON it arrives as a number,
+		// and only the decoder turns it back into a Date. This is the assertion
+		// that catches a plan returning the right keys with the wrong types.
+		const rows = await bothAgree((d) =>
+			d.query.posts.findMany({ with: { author: true }, orderBy: { id: 'asc' } })
+		) as { author: { createdAt: unknown; active: unknown } }[];
+
+		expect(rows[0]!.author.createdAt).toBeInstanceOf(Date);
+		expect(typeof rows[0]!.author.active).toBe('boolean');
+	});
+
+	it('agrees with a column selection and a nested where', async () => {
+		await bothAgree((d) =>
+			d.query.users.findMany({
+				columns: { id: true, name: true },
+				with: { posts: { columns: { id: true, views: true }, where: { views: { gt: 4 } } } },
+				orderBy: { id: 'asc' },
+			})
+		);
+	});
+
+	it('agrees on a nested order and limit', async () => {
+		await bothAgree((d) =>
+			d.query.users.findMany({
+				with: { posts: { orderBy: { views: 'desc' }, limit: 1 } },
+				orderBy: { id: 'asc' },
+			})
+		);
+	});
+
+	it('agrees on a plain one-to-many child table', async () => {
+		await bothAgree((d) => d.query.posts.findMany({ with: { tags: true }, orderBy: { id: 'asc' } }));
+	});
+
+	it('agrees on findFirst', async () => {
+		await bothAgree((d) => d.query.users.findFirst({ with: { posts: true }, orderBy: { id: 'asc' } }));
+	});
+});
+
+describe('joined strategy actually runs one statement', () => {
+	/** Count statements by strategy — the check that the tests above are not vacuous. */
+	const countStatements = async (
+		strategy: 'split' | 'joined',
+		run: (d: typeof db) => unknown,
+	) => {
+		const sqls: string[] = [];
+		const d = drizzle({
+			client: DB,
+			relations: schema.relations,
+			relationalStrategy: strategy,
+			onQuery: (e) => void sqls.push(e.sql),
+		});
+		await run(d);
+		return sqls;
+	};
+
+	it('sends 1 statement where the split plan sends 2', async () => {
+		const run = (d: typeof db) => d.query.users.findMany({ with: { posts: true } });
+
+		const split = await countStatements('split', run);
+		const one = await countStatements('joined', run);
+
+		expect(split).toHaveLength(2);
+		expect(one).toHaveLength(1);
+		expect(one[0]).toMatch(/json_group_array/);
+	});
+
+	it('sends 1 statement for a two-level nesting, where the split plan sends 3', async () => {
+		const run = (d: typeof db) => d.query.users.findMany({ with: { posts: { with: { author: true } } } });
+
+		expect(await countStatements('split', run)).toHaveLength(3);
+		expect(await countStatements('joined', run)).toHaveLength(1);
+	});
+
+	it('handles a plain one-to-many in one statement too', async () => {
+		// `posts.tags` looks like a junction but is not one: `postTags` is a
+		// child table, so this is an ordinary one-to-many and the joined plan
+		// covers it. The real junction case is asserted in the m2m suite.
+		const run = (d: typeof db) => d.query.posts.findMany({ with: { tags: true } });
+
+		expect(await countStatements('joined', run)).toHaveLength(1);
 	});
 });
