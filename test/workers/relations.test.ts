@@ -1,7 +1,7 @@
 import { env } from 'cloudflare:test';
 import { beforeEach, describe, expect, it } from 'vitest';
 import { createSchema } from '../../src/ddl.js';
-import { drizzle, eq, integer, primaryKey, ph, sql, sqliteTable, text } from '../../src/index.js';
+import { blob, drizzle, eq, integer, primaryKey, ph, sql, sqliteTable, text } from '../../src/index.js';
 import { defineRelations } from '../../src/relations/index.js';
 import * as schema from '../schema.js';
 
@@ -843,15 +843,34 @@ describe('joined strategy', () => {
 	it('returns null, not undefined, for an absent one relation', async () => {
 		// `undefined` is not merely a different spelling: the declared type is
 		// `T | null`, `row.x === null` stops working, and `JSON.stringify` drops
-		// the key entirely, so an API response loses the field.
-		await db.delete(schema.users).where(eq(schema.users.id, 2));
-		await db.delete(schema.posts).where(eq(schema.posts.id, 12));
+		// the key entirely, so an API response loses the field rather than
+		// reporting it empty.
+		//
+		// This needs a relation that can actually resolve to nothing, and none
+		// in the shared fixture can — `posts.author` crosses a non-null foreign
+		// key, and everything else is a `many`, whose empty case is `[]` and is
+		// asserted above. `postTags.addedBy` is the one column that can point at
+		// nothing: nullable, and carrying no foreign key, so it can also name a
+		// user that was never there.
+		const optional = defineRelations({ users: schema.users, postTags: schema.postTags }, (r) => ({
+			postTags: { adder: r.one.users({ from: r.postTags.addedBy, to: r.users.id }) },
+		}));
+		const optionalSplit = drizzle({ client: DB, relations: optional });
+		const optionalJoined = drizzle({ client: DB, relations: optional, relationalStrategy: 'joined' });
 
-		const rows = await bothAgree((d) =>
-			d.query.postTags.findMany({ with: { post: true }, orderBy: { tag: 'asc' } })
-		) as Record<string, unknown>[];
+		await db.update(schema.postTags).set({ addedBy: 999 }).where(eq(schema.postTags.tag, 'sql'));
 
-		for (const row of rows) expect('post' in row).toBe(true);
+		const config = { columns: { tag: true }, with: { adder: true }, orderBy: { tag: 'asc' } } as const;
+		const [split, one] = await Promise.all([
+			optionalSplit.query.postTags.findMany(config),
+			optionalJoined.query.postTags.findMany(config),
+		]);
+
+		// Both ways of being absent, since the plans reach them differently: the
+		// split plan never binds a null key, and drops a key that matched
+		// nothing at stitching time. `d1` is the first, `sql` the second.
+		expect(one).toEqual(split);
+		expect(one).toEqual([{ tag: 'd1', adder: null }, { tag: 'sql', adder: null }]);
 	});
 
 	it('decodes nested values, not just their shape', async () => {
@@ -925,5 +944,158 @@ describe('joined strategy actually runs one statement', () => {
 		const run = (d: typeof db) => d.query.posts.findMany({ with: { tags: true } });
 
 		expect(await countStatements('joined', run)).toHaveLength(1);
+	});
+});
+
+/**
+ * The two guards that keep `json_object` from being handed something it
+ * refuses: a binary value, and more arguments than SQLite will take. They live
+ * here rather than with the matrix above because each needs a fixture the
+ * shared schema does not have — a child with a blob, and a very wide one.
+ *
+ * Both fail *open* — the fallback produces no wrong answer, only more
+ * statements — which is exactly why they need pinning. A guard that stops
+ * firing is invisible in a diff and invisible in a passing suite; it shows up
+ * as a query that used to work throwing a D1 error. The statement count is
+ * therefore part of each assertion: "it returned the right rows" would stay
+ * green if the plan quietly fell back for everything.
+ */
+describe('joined strategy falls back rather than failing', () => {
+	const owners = sqliteTable('joined_owners', {
+		id: integer('id').primaryKey(),
+		name: text('name').notNull(),
+	});
+	const files = sqliteTable('joined_files', {
+		id: integer('id').primaryKey(),
+		ownerId: integer('owner_id').notNull(),
+		bytes: blob('bytes'),
+	});
+
+	/**
+	 * Wide enough to overrun `json_object`, which costs two arguments per key
+	 * against SQLite's 127 — so 63 keys is the ceiling and 64 is one too many.
+	 */
+	const wide = sqliteTable('joined_wide', {
+		id: integer('id').primaryKey(),
+		ownerId: integer('owner_id').notNull(),
+		...Object.fromEntries(Array.from({ length: 70 }, (_, i) => [`c${i}`, text(`c${i}`)])),
+	});
+
+	const rel = defineRelations({ owners, files, wide }, (r) => ({
+		owners: {
+			files: r.many.files({ from: r.owners.id, to: r.files.ownerId }),
+			wide: r.many.wide({ from: r.owners.id, to: r.wide.ownerId }),
+		},
+		// Same owner, so a `wide` row can carry a nested relation without a
+		// third table — this exists to be counted as a key, not to mean much.
+		wide: { files: r.many.files({ from: r.wide.ownerId, to: r.files.ownerId }) },
+	}));
+
+	const splitDb = drizzle({ client: DB, relations: rel });
+	const joinedDb = drizzle({ client: DB, relations: rel, relationalStrategy: 'joined' });
+
+	/** The statements the joined plan sends: 1 means it did not fall back. */
+	const joinedStatements = async (run: (d: typeof joinedDb) => unknown) => {
+		const sqls: string[] = [];
+		const d = drizzle({
+			client: DB,
+			relations: rel,
+			relationalStrategy: 'joined',
+			onQuery: (e) => void sqls.push(e.sql),
+		});
+		await run(d);
+		return sqls;
+	};
+
+	/** A `columns` selection naming `count` of the wide table's columns. */
+	const wideColumns = (count: number): Record<string, boolean> => {
+		const columns: Record<string, boolean> = { id: true };
+		for (let i = 0; i < count - 1; i++) columns[`c${i}`] = true;
+		return columns;
+	};
+
+	const bytes = new Uint8Array([0x00, 0xAA, 0xBB]);
+
+	beforeEach(async () => {
+		for (const name of ['joined_files', 'joined_wide', 'joined_owners']) {
+			await DB.prepare(`drop table if exists "${name}"`).run();
+		}
+		for (const statement of createSchema([owners, files, wide])) await DB.prepare(statement).run();
+
+		await splitDb.insert(owners).values({ id: 1, name: 'Ada' });
+		await splitDb.insert(files).values({ id: 1, ownerId: 1, bytes });
+		// Only the two declared columns: the `c*` ones are built dynamically, so
+		// they are wide at runtime but not statically known here. Nothing in
+		// this suite needs their values, only their count.
+		await splitDb.insert(wide).values({ id: 1, ownerId: 1 });
+	});
+
+	it('falls back when a blob column is in a relation payload', async () => {
+		// `json_object('bytes', <blob>)` is not a bad value, it is a hard error:
+		// `JSON cannot hold BLOB values`. Every `blob()` mode is affected, since
+		// `json` and `bigint` are blob-backed too.
+		const run = (d: typeof joinedDb) => d.query.owners.findMany({ with: { files: true } });
+
+		expect(await joinedStatements(run)).toHaveLength(2);
+		const [split, one] = await Promise.all([run(splitDb), run(joinedDb)]);
+		expect(one).toEqual(split);
+		expect((one as { files: { bytes: Uint8Array }[] }[])[0]!.files[0]!.bytes).toEqual(bytes);
+	});
+
+	it('stays on the joined plan when the blob column is not projected', async () => {
+		// The guard reads the projection, not the table. Falling back for any
+		// table that merely *has* a blob would cost a round trip on every query
+		// against it — silently, and for nothing.
+		expect(await joinedStatements((d) =>
+			d.query.owners.findMany({ with: { files: { columns: { id: true } } } })
+		)).toHaveLength(1);
+
+		expect(await joinedStatements((d) =>
+			d.query.owners.findMany({ with: { files: { columns: { bytes: false } } } })
+		)).toHaveLength(1);
+	});
+
+	it('takes 63 keys in one statement, and falls back at 64', async () => {
+		// Measured against D1 rather than reasoned about: 63 passes, 64 is
+		// rejected with `too many arguments on function json_object`. This is
+		// the limit doc 06 cites as a reason to prefer the split plan.
+		expect(await joinedStatements((d) =>
+			d.query.owners.findMany({ with: { wide: { columns: wideColumns(63) } } })
+		)).toHaveLength(1);
+
+		const run = (d: typeof joinedDb) => d.query.owners.findMany({ with: { wide: { columns: wideColumns(64) } } });
+		expect(await joinedStatements(run)).toHaveLength(2);
+
+		// And the fallback answers, rather than merely failing more quietly —
+		// all 64 requested keys come back, which is the whole point of taking
+		// the slower plan.
+		const [split, one] = await Promise.all([run(splitDb), run(joinedDb)]);
+		expect(one).toEqual(split);
+		expect(Object.keys((one as { wide: Record<string, unknown>[] }[])[0]!.wide[0]!)).toHaveLength(64);
+	});
+
+	it('counts extras and nested relations toward the same ceiling', async () => {
+		// The cap is on `json_object` arity, not on how many columns a table
+		// has: an extra and a nested relation each take a key too. Counting only
+		// columns would let a 63-column payload with one extra through, and D1
+		// would reject the statement.
+		const withExtra = (columns: number) => (d: typeof joinedDb) =>
+			d.query.owners.findMany({
+				with: { wide: { columns: wideColumns(columns), extras: { n: (t, { sql }) => sql`${t.id} + 1` } } },
+			});
+
+		expect(await joinedStatements(withExtra(62))).toHaveLength(1);
+		expect(await joinedStatements(withExtra(63))).toHaveLength(2);
+
+		const withRelation = (columns: number) => (d: typeof joinedDb) =>
+			d.query.owners.findMany({
+				with: { wide: { columns: wideColumns(columns), with: { files: { columns: { id: true } } } } },
+			});
+
+		// 3, not 2: falling back costs a statement per *level*, and this query
+		// is two deep. That it is the whole query rather than the offending
+		// level is deliberate — see `#useJoined`.
+		expect(await joinedStatements(withRelation(62))).toHaveLength(1);
+		expect(await joinedStatements(withRelation(63))).toHaveLength(3);
 	});
 });
