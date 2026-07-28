@@ -220,3 +220,43 @@ export const asPothosRelations = <TRelations extends Record<string, unknown>>(
 	relations: TRelations,
 ): PothosRelations<TRelations> =>
 	asDrizzleRelations(relations) as unknown as PothosRelations<TRelations>;
+
+// ------------------------------------------- Pothos' resolver-side find-config
+
+/**
+ * Pothos' `query()` result, retyped as the d1zzle find-config it already is.
+ *
+ * `@pothos/plugin-drizzle` hands every drizzle-backed resolver a `query()` that
+ * merges the caller's selection with the columns and relations the GraphQL
+ * selection set needs, and the result goes straight to
+ * `db.query.<table>.findMany` / `findFirst`.
+ *
+ * The merged config is a valid d1zzle config at runtime, but not at the type
+ * level, because the plugin declares one extra key:
+ *
+ * ```ts
+ * extras: { $pothosQueryFor: SQL<'places' | undefined> }
+ * ```
+ *
+ * where `SQL` is Drizzle's. Ours renders through `toQuery(ctx?: RenderContext)`
+ * and Drizzle's through `toQuery(config: BuildQueryConfig)`, so the marker is
+ * not assignable to `ExtrasArg` and the whole config is rejected with it.
+ *
+ * The marker is **phantom**: it appears only in the plugin's `.d.ts` files and
+ * is never constructed — there are zero occurrences in its emitted JavaScript.
+ * So there is nothing to render and nothing for `ExtrasArg` to learn to accept;
+ * the type just has to stop being threaded through. This drops it, and returns
+ * the selection's own type so the config keeps being checked.
+ *
+ * ```ts
+ * ctx.db.query.places.findMany(pothosFindConfig(query, { where: { clubId } }))
+ * ```
+ *
+ * `where`, `columns`, `with` and `orderBy` are checked against the schema by
+ * `findMany`'s own `TConfig extends TypedFindConfig<…>` constraint, which is
+ * what the previous `as never` laundering gave up.
+ */
+export const pothosFindConfig = <TConfig>(
+	query: (selection?: never) => unknown,
+	selection: TConfig,
+): TConfig => (query as unknown as (s: TConfig) => TConfig)(selection);
