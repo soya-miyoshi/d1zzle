@@ -1,10 +1,10 @@
 import type { CompiledQuery } from '../plan/compile.js';
-import { compileSelect, projectedColumns } from '../plan/compile.js';
+import { compileSelect, projectedColumns, projectedNullableGroups } from '../plan/compile.js';
 import type { Join, JoinType, Selection, SelectPlan } from '../plan/plan.js';
 import { emptySelectPlan } from '../plan/plan.js';
 import type { Column, ColumnConfig, ColumnMeta } from '../schema/columns.js';
 import { columnClassFor, isColumn } from '../schema/columns.js';
-import type { ColumnsMap, NameOf, Subquery, Table } from '../schema/table.js';
+import type { ColumnsMap, NameOf, NullableColumns, Subquery, Table } from '../schema/table.js';
 import type { InferSelect, Simplify } from '../schema/infer.js';
 import { createSubquery } from '../schema/table.js';
 import type { Condition } from '../sql/expressions.js';
@@ -21,11 +21,22 @@ import type { QueryExecutor, Runnable } from './types.js';
  * one of them forces a `!` on each read out of a subquery.
  */
 export type SubqueryColumns<TRow> = {
-	[K in keyof TRow]-?: NonNullable<TRow[K]> extends SubqueryLeaf ? Column<{
-			data: NonNullable<TRow[K]>;
-			notNull: null extends TRow[K] ? false : true;
-			hasDefault: boolean;
-		}>
+	[K in keyof TRow]-?: unknown extends NonNullable<TRow[K]>
+		// An untyped `sql\`…\`` produces `unknown`, which is not a scalar and not
+		// an object either — left to the group branch it turned `sq.n` into a
+		// structural expansion of the `Column` class. A value the projection
+		// could not describe is still a value, so it reads as one column of
+		// unknown type rather than as a group of columns.
+		? Column<{ data: unknown; notNull: false; hasDefault: boolean }>
+		: NonNullable<TRow[K]> extends SubqueryLeaf ? Column<{
+				data: NonNullable<TRow[K]>;
+				notNull: null extends TRow[K] ? false : true;
+				hasDefault: boolean;
+			}>
+		// A group the inner join could miss stays nullable through `.as()`: the
+		// mark is what `Out<>` reads to widen it, matching the `null` the mapper
+		// now returns for it.
+		: null extends TRow[K] ? SubqueryColumns<NonNullable<TRow[K]>> & NullableColumns
 		: SubqueryColumns<NonNullable<TRow[K]>>;
 };
 
@@ -39,6 +50,16 @@ export type SubqueryColumns<TRow> = {
  * a plain object on the wrong side: it reads as a group. That is the narrow
  * cost of not carrying the selection's shape into the row type, and it is
  * visible at the call site rather than at run time.
+ *
+ * The known limitation, then, is exactly one case: a column whose decoded value
+ * is a plain object — `text({ mode: 'json' })` over an object, or a
+ * `sql<{ … }>` fragment — reads as a group of columns on a subquery surface,
+ * and has to be selected out under a cast. Everything else lands correctly:
+ * `unknown` is handled above, and the runtime half of the surface is derived
+ * from the projection (`projectedColumns`) rather than from the row, so the SQL
+ * is right either way. Closing the last case means threading the selection's
+ * *type* through `SelectState` into `.as()`, which is a larger change than the
+ * one symptom justifies.
  */
 type SubqueryLeaf = string | number | bigint | boolean | Date | Uint8Array | ArrayBuffer | null | undefined;
 
@@ -193,6 +214,7 @@ export class SelectBuilder<S extends SelectState> implements Promise<ResultRow<S
 			name,
 			this,
 			subqueryColumns(this.plan, name),
+			projectedNullableGroups(this.plan),
 		) as unknown as Subquery<SubqueryColumns<ResultRow<S>>, TName>;
 	}
 

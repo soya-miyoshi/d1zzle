@@ -8,6 +8,7 @@ import {
 	getFlatColumns,
 	getTableColumns,
 	getTableName,
+	getTableNullableGroups,
 	getTableOriginalName,
 	getTableSource,
 	isAliased,
@@ -125,11 +126,24 @@ const flattenSelection = (selection: Selection, prefix: readonly string[] = []):
 
 const tableSelection = (t: Table): Selection => getTableColumns(t) as unknown as Selection;
 
+/**
+ * A source's own nullable groups, re-pathed for where it sits in this row.
+ *
+ * Only a subquery has any: `.as()` records the groups its inner plan left
+ * nullable, because reading them back out of the subquery gives the outer plan
+ * nothing to re-derive them from — its `joins` are empty, and the columns it
+ * sees are the subquery's, all of them ordinarily nullable on their own.
+ */
+const inheritedNullable = (t: Table, prefix: string): string[] =>
+	[...getTableNullableGroups(t)].map((path) => (prefix ? `${prefix}.${path}` : path));
+
 const implicitSelection = (plan: SelectPlan): { selection: Selection; nullable: Set<string> } => {
 	const nullable = new Set<string>();
 	if (!plan.from) return { selection: {}, nullable };
 
-	if (plan.joins.length === 0) return { selection: tableSelection(plan.from), nullable };
+	if (plan.joins.length === 0) {
+		return { selection: tableSelection(plan.from), nullable: new Set(inheritedNullable(plan.from, '')) };
+	}
 
 	// With joins, an unqualified select produces one nested group per table,
 	// keyed by table name — this is where duplicate column names would
@@ -137,9 +151,12 @@ const implicitSelection = (plan: SelectPlan): { selection: Selection; nullable: 
 	const selection: Record<string, Selection> = {
 		[getTableName(plan.from)]: tableSelection(plan.from),
 	};
+	for (const path of inheritedNullable(plan.from, getTableName(plan.from))) nullable.add(path);
 	for (const join of plan.joins) {
-		selection[getTableName(join.table)] = tableSelection(join.table);
-		if (join.type === 'left' || join.type === 'full') nullable.add(getTableName(join.table));
+		const name = getTableName(join.table);
+		selection[name] = tableSelection(join.table);
+		for (const path of inheritedNullable(join.table, name)) nullable.add(path);
+		if (join.type === 'left' || join.type === 'full') nullable.add(name);
 		if (join.type === 'right' || join.type === 'full') nullable.add(getTableName(plan.from));
 	}
 	return { selection, nullable };
@@ -176,6 +193,18 @@ export interface ProjectedColumn {
  * whose declared surface named columns the statement inside it does not emit —
  * `no such column`, from SQL that looked right.
  */
+/**
+ * The groups this plan's rows can return as `null`, by the same paths
+ * `projectedColumns` reports — what `.as()` has to carry so the property
+ * survives being read back out of a subquery.
+ *
+ * An explicit selection has none: nothing today marks a hand-written projection
+ * nullable, so a `db.select({ p: { … } })` over a left join is an object of
+ * nulls both directly and through `.as()`. Consistent, and unchanged here.
+ */
+export const projectedNullableGroups = (plan: SelectPlan): ReadonlySet<string> =>
+	plan.selection === undefined ? implicitSelection(plan).nullable : new Set<string>();
+
 export const projectedColumns = (plan: SelectPlan): readonly ProjectedColumn[] => {
 	const selection = plan.selection ?? implicitSelection(plan).selection;
 	const leaves = flattenSelection(selection);

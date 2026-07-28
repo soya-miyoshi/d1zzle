@@ -243,6 +243,23 @@ describe('joins', () => {
 		// so the nesting has to survive a round trip through `.as()`.
 		expect(rows).toEqual([{ posts: expect.objectContaining({ title: 'second' }), users: expect.objectContaining({ name: 'Ada' }) }]);
 	});
+
+	it('gives a missed left join the same null group through .as() as directly', async () => {
+		// Two spellings of one query used to give two shapes: `posts: null`
+		// read directly, `posts: { id: null, … }` read back out of the
+		// subquery, because the outer plan has no joins to re-derive it from.
+		// Bob has no posts.
+		const db = d1zzle(DB);
+		const on = eq(posts.authorId, users.id);
+
+		const direct = await db.select().from(users).leftJoin(posts, on).where(eq(users.id, 2));
+
+		const s = db.select().from(users).leftJoin(posts, on).as('s');
+		const viaSubquery = await db.select().from(s).where(eq(s.users.id, 2));
+
+		expect(direct).toEqual([{ users: expect.objectContaining({ name: 'Bob' }), posts: null }]);
+		expect(viaSubquery).toEqual(direct);
+	});
 });
 
 describe('expressions against real SQLite', () => {

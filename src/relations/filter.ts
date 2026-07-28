@@ -111,9 +111,15 @@ export interface ColumnFilterOperators<T> {
 	 * known at compile time — a placeholder filled afterwards can only ever bind
 	 * the whole array to a single `?`, which SQLite reads as a scalar. Bind the
 	 * list at build time, or match against a subquery.
+	 *
+	 * The subquery half is spelled out here rather than left to the runtime:
+	 * `assertBindableList` accepts a `SQLChunk` and the error it throws points at
+	 * exactly that escape hatch, but the type used to admit only an array — so
+	 * the alternative the message recommends needed a cast, which makes the guard
+	 * the wall it says it is not.
 	 */
-	in?: readonly T[];
-	notIn?: readonly T[];
+	in?: readonly T[] | SQLChunk;
+	notIn?: readonly T[] | SQLChunk;
 	like?: Operand<string>;
 	ilike?: Operand<string>;
 	notLike?: Operand<string>;

@@ -311,7 +311,8 @@ describe('the filter DSL', () => {
 		const authors = db.select({ id: schema.posts.authorId }).from(schema.posts)
 			.where(eq(schema.posts.views, 50));
 
-		expect(await db.query.users.findMany({ columns: { id: true }, where: { id: { in: authors } } as never }))
+		// No cast: the type admits the subquery the thrown message recommends.
+		expect(await db.query.users.findMany({ columns: { id: true }, where: { id: { in: authors } } }))
 			.toEqual([{ id: 1 }]);
 	});
 

@@ -6,6 +6,7 @@ import {
 	count,
 	desc,
 	eq,
+	getTableColumns,
 	gt,
 	inArray,
 	isNull,
@@ -292,6 +293,64 @@ describe('select compilation', () => {
 	it('memoizes compilation per builder instance', () => {
 		const builder = query.select().from(users);
 		expect(builder.compile()).toBe(builder.compile());
+	});
+});
+
+describe('the surface a subquery exposes', () => {
+	type RowOf<T> = Awaited<T> extends readonly (infer R)[] ? R : never;
+
+	const on = eq(posts.authorId, users.id);
+
+	it('types a group of columns as the group it reads back as', () => {
+		// The runtime has nested since the joined strategy landed, but `Out<>`
+		// only had a `Column` branch, so every group inferred as `never` — a
+		// type error on `rows[0].posts.title`, for a value the query returns.
+		const s = query.select().from(users).innerJoin(posts, on).as('s');
+		type Row = RowOf<ReturnType<typeof plain.all>>;
+		const plain = query.select().from(s);
+
+		expectTypeOf<Row['users']>().toEqualTypeOf<InferSelect<typeof users>>();
+		expectTypeOf<Row['posts']>().toEqualTypeOf<InferSelect<typeof posts>>();
+	});
+
+	it('keeps a left-joined group nullable through .as()', () => {
+		const s = query.select().from(users).leftJoin(posts, on).as('s');
+		type Row = RowOf<ReturnType<typeof plain.all>>;
+		const plain = query.select().from(s);
+
+		expectTypeOf<Row['users']>().toEqualTypeOf<InferSelect<typeof users>>();
+		expectTypeOf<Row['posts']>().toEqualTypeOf<InferSelect<typeof posts> | null>();
+	});
+
+	it('returns null for that group rather than an object of nulls', () => {
+		// The type above is only half of it: `implicitSelection` derives
+		// nullability from `plan.joins`, and the outer plan over a subquery has
+		// none — so the same query gave `posts: null` read directly and
+		// `posts: { id: null, … }` read through `.as()`.
+		const s = query.select().from(users).leftJoin(posts, on).as('s');
+		const compiled = query.select().from(s).compile();
+
+		const userColumns = Object.keys(getTableColumns(users)).length;
+		const row = compiled.columnNames.map((_, i) => (i < userColumns ? 1 : null));
+		const [mapped] = compiled.map([row]);
+
+		expect(mapped!.posts).toBeNull();
+		expect(mapped!.users).not.toBeNull();
+	});
+
+	it('treats an untyped sql fragment as one column, not a group', () => {
+		// `SubqueryLeaf` enumerates scalars, so `unknown` — what a bare
+		// `sql\`…\`` produces — fell to the group branch and expanded the
+		// `Column` class structurally at `x.n`.
+		const x = query.select({ n: sql`unixepoch()`, m: sql<number>`1` }).from(users).as('x');
+		type Row = RowOf<ReturnType<typeof selected.all>>;
+		const selected = query.select({ n: x.n, m: x.m }).from(x);
+
+		expectTypeOf<Row['n']>().toEqualTypeOf<unknown>();
+		expectTypeOf<Row['m']>().toEqualTypeOf<number>();
+		expect(selected.compile().sql).toBe(
+			'select "x"."n", "x"."m" from (select unixepoch() as "n", 1 as "m" from "users") "x"',
+		);
 	});
 });
 

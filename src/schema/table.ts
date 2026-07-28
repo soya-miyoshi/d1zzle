@@ -38,6 +38,21 @@ export interface ColumnsMap {
 	[key: string]: Column<any> | ColumnsMap;
 }
 
+/**
+ * Type-level marker on a *group* of subquery columns that an outer join can
+ * leave null, so `Out<>` can widen it the way it widens a nullable column.
+ *
+ * A group's nullability has nowhere else to live: it is not a property of any
+ * one column in it — every leaf is independently nullable — but of the group as
+ * a whole, which the runtime mapper collapses to `null` when all of its columns
+ * come back null. The declaration is ambient: the marker is never a real
+ * property, only a phantom key on the type `.as()` reports.
+ */
+export declare const NullableGroup: unique symbol;
+
+/** A group of subquery columns that reads back as `null` on a missed join. */
+export type NullableColumns = { readonly [NullableGroup]?: true };
+
 export interface TableMeta<TColumns extends ColumnsMap, TName extends string = string> extends SQLChunk {
 	readonly [IsTable]: true;
 	/** Effective name — the alias, when the table has been aliased. */
@@ -365,20 +380,43 @@ export const isAliased = (t: Table): boolean => t[TableName] !== t[TableOriginal
  */
 export const TableSource = Symbol.for('d1zzle:TableSource');
 
+/**
+ * Groups inside the subquery's rows that an outer join can leave null, as dotted
+ * paths (`posts`, `a.b`) relative to the subquery's own row.
+ *
+ * Without this, a left join wrapped in `.as()` lost its one interesting
+ * property: selecting back out of the subquery re-derived nullability from the
+ * *outer* plan's joins, of which there are none, so a missed join came back as
+ * an object full of nulls instead of the `null` the same query returns when read
+ * directly.
+ */
+export const TableNullableGroups = Symbol.for('d1zzle:TableNullableGroups');
+
 export type Subquery<TColumns extends ColumnsMap = ColumnsMap, TName extends string = string> =
 	& Table<TColumns, TName>
 	& {
 	readonly [TableSource]: SQLChunk;
+	readonly [TableNullableGroups]: ReadonlySet<string>;
 };
 
 export const createSubquery = <TColumns extends ColumnsMap, TName extends string>(
 	aliasName: TName,
 	source: SQLChunk,
 	columns: TColumns,
+	nullableGroups: ReadonlySet<string> = new Set(),
 ): Subquery<TColumns, TName> => {
 	const t = buildTable(aliasName, aliasName, columns, []);
-	return Object.assign(t, { [TableSource]: source }) as unknown as Subquery<TColumns, TName>;
+	return Object.assign(t, {
+		[TableSource]: source,
+		[TableNullableGroups]: nullableGroups,
+	}) as unknown as Subquery<TColumns, TName>;
 };
 
 export const getTableSource = (t: Table): SQLChunk | undefined =>
 	(t as Partial<Subquery>)[TableSource];
+
+const EMPTY_GROUPS: ReadonlySet<string> = new Set();
+
+/** Empty for a declared table: only a subquery can carry a nullable group. */
+export const getTableNullableGroups = (t: Table): ReadonlySet<string> =>
+	(t as Partial<Subquery>)[TableNullableGroups] ?? EMPTY_GROUPS;
