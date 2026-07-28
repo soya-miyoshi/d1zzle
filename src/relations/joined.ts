@@ -34,8 +34,9 @@ import type { Column } from '../schema/columns.js';
 import type { Table } from '../schema/table.js';
 import { alias, getTableColumns, getTableName, getTableOriginalName } from '../schema/table.js';
 import type { SQLChunk } from '../sql/sql.js';
-import { sql } from '../sql/sql.js';
+import { isPlaceholder, sql } from '../sql/sql.js';
 import type { Relation, RelationsConfig, TableRelationalConfig } from './define.js';
+import { fieldNameOf, pickColumns } from './projection.js';
 import type { FindConfig } from './query.js';
 
 /** How a level's JSON payload maps back onto decoded values. */
@@ -50,19 +51,6 @@ const quote = (name: string): string => `"${name.replaceAll('"', '""')}"`;
 
 /** Quote a SQL string literal — the keys inside `json_object`. */
 const literal = (value: string): string => `'${value.replaceAll("'", "''")}'`;
-
-/**
- * The column key a `Column` is filed under in a table config.
- *
- * Relations carry column objects; the projection is keyed by TypeScript name,
- * and the two differ whenever a column was declared with an explicit SQL name.
- */
-const fieldNameOf = (columns: Record<string, Column<any>>, column: Column<any>): string => {
-	for (const [key, candidate] of Object.entries(columns)) {
-		if (candidate.name === column.name) return key;
-	}
-	return column.name;
-};
 
 /**
  * Whether every relation this config reaches can be expressed as a correlated
@@ -89,21 +77,51 @@ export function supportsJoined(
 
 		const target = schema[relation.targetTableName];
 		if (!target) return false;
-		if (value !== true && !supportsJoined(value as FindConfig, target, schema)) return false;
+
+		const childConfig: FindConfig = value === true ? {} : value as FindConfig;
+
+		// A placeholder in a nested page. This plan could serve it — correlated
+		// subqueries make per-parent paging natural — but the split plan cannot,
+		// and `relationalStrategy` is a performance switch: it must not change
+		// which queries are legal. So this defers to split, which refuses with a
+		// message describing the plan that actually ran. If split ever learns to
+		// take one, this guard is what to delete.
+		if (isPlaceholder(childConfig.limit) || isPlaceholder(childConfig.offset)) return false;
+
+		if (!payloadIsExpressible(childConfig, target)) return false;
+		if (!supportsJoined(childConfig, target, schema)) return false;
 	}
 	return true;
 }
 
-/** Which columns a level projects: explicit `true`s win, else all but `false`. */
-const pickColumns = (
-	all: Record<string, Column<any>>,
-	selection: Record<string, boolean | undefined> | undefined,
-): string[] => {
-	const keys = Object.keys(all);
-	if (!selection) return keys;
-	const included = keys.filter((key) => selection[key] === true);
-	if (included.length > 0) return included;
-	return keys.filter((key) => selection[key] !== false);
+/**
+ * SQLite's `SQLITE_MAX_FUNCTION_ARG`, which defaults to 127 and is what D1
+ * ships. `json_object` costs two arguments per key, so a payload wider than
+ * this many keys is rejected with `too many arguments on function json_object`.
+ * Confirmed against D1: 63 keys pass, 70 do not.
+ */
+const MAX_JSON_OBJECT_KEYS = 63;
+
+/**
+ * Whether a level's payload can survive a trip through `json_object`.
+ *
+ * Only *relation* levels are checked. A top-level column is selected directly
+ * and never enters JSON, so neither limit applies to it — which is why this is
+ * called on the child rather than folded into the loop above.
+ */
+const payloadIsExpressible = (config: FindConfig, tableConfig: TableRelationalConfig): boolean => {
+	// JSON has no binary type: `json_object('b', <blob>)` fails outright with
+	// `JSON cannot hold BLOB values`. Every `blob()` mode is affected —
+	// `buffer`, and the blob-backed `json` and `bigint` — because all three
+	// store the column as `blob`.
+	for (const key of pickColumns(tableConfig.columns, config.columns)) {
+		if (tableConfig.columns[key]?.config.type === 'blob') return false;
+	}
+
+	const keys = pickColumns(tableConfig.columns, config.columns).length
+		+ Object.keys(config.with ?? {}).length
+		+ Object.keys(config.extras ?? {}).length;
+	return keys <= MAX_JSON_OBJECT_KEYS;
 };
 
 export interface JoinedLevel {
@@ -127,6 +145,7 @@ export function buildLevel(
 	next: () => string,
 	compileWhere: (config: FindConfig, tableConfig: TableRelationalConfig, table: Table) => SQLChunk | undefined,
 	resolveOrderBy: (config: FindConfig, columns: Record<string, Column<any>>) => SQLChunk[],
+	resolveExtras: (config: FindConfig, columns: Record<string, Column<any>>) => Record<string, SQLChunk>,
 ): JoinedLevel {
 	const columns = getTableColumns(table) as unknown as Record<string, Column<any>>;
 	const projected = pickColumns(tableConfig.columns, config.columns);
@@ -138,6 +157,15 @@ export function buildLevel(
 		if (!column) continue;
 		selection[key] = column;
 		shapeColumns[key] = column.config.decode;
+	}
+
+	// Extras are projected like columns. Dropping them was silent: a Pothos
+	// computed field or an aggregate simply vanished from the row, with no
+	// error and no missing-key complaint anywhere.
+	for (const [key, expr] of Object.entries(resolveExtras(config, columns))) {
+		selection[key] = expr;
+		// No decoder: an extra is an arbitrary expression, exactly as in split.
+		shapeColumns[key] = undefined;
 	}
 
 	const relations: JoinedShape['relations'] = {};
@@ -152,7 +180,16 @@ export function buildLevel(
 		const childTable = alias(targetConfig.table, childAlias) as unknown as Table;
 		const childColumns = getTableColumns(childTable) as unknown as Record<string, Column<any>>;
 
-		const child = buildLevel(childTable, targetConfig, childConfig, schema, next, compileWhere, resolveOrderBy);
+		const child = buildLevel(
+			childTable,
+			targetConfig,
+			childConfig,
+			schema,
+			next,
+			compileWhere,
+			resolveOrderBy,
+			resolveExtras,
+		);
 
 		// Correlate the inner query to this level: parent source column equals
 		// child target column, positionally, for composite keys too.
@@ -180,10 +217,13 @@ export function buildLevel(
 			.join(', ');
 
 		const many = relation.relationType === 'many';
+		// No `coalesce(…, json_array())` around the aggregate. Drizzle emits one,
+		// but it cannot fire: `json_group_array` over zero rows returns `[]`, not
+		// NULL, and an aggregate subquery always yields exactly one row —
+		// verified against D1. The `one` branch genuinely can be NULL, and
+		// `decodeJoined` turns that into `null`.
 		selection[name] = many
-			// `coalesce(…, json_array())` so a parent with no children gets `[]`
-			// rather than SQL NULL, which is what the split plan returns.
-			? sql`coalesce((select json_group_array(json_object(${sql.raw(objectArgs)})) from (${inner}) as "t"), json_array())`
+			? sql`(select json_group_array(json_object(${sql.raw(objectArgs)})) from (${inner}) as "t")`
 			: sql`(select json_object(${sql.raw(objectArgs)}) from (${inner}) as "t")`;
 
 		relations[name] = { many, shape: child.shape };
@@ -216,8 +256,16 @@ const renderInner = (
 	// A `one` relation takes at most one row whatever the data says, so the
 	// limit is not optional: without it a broken key would silently pick an
 	// arbitrary row out of several.
-	if (relation.relationType === 'one') out = sql`${out} limit 1`;
-	else if (config.limit !== undefined) out = sql`${out} limit ${config.limit}`;
+	if (relation.relationType === 'one') {
+		out = sql`${out} limit 1`;
+	} else if (config.limit !== undefined) {
+		out = sql`${out} limit ${config.limit}`;
+	} else if (config.offset !== undefined) {
+		// SQLite parses OFFSET only as a suffix of LIMIT, so `offset` without
+		// `limit` is a syntax error rather than a skip. `-1` is SQLite's own
+		// spelling for "no limit" and is what its documentation prescribes here.
+		out = sql`${out} limit -1`;
+	}
 
 	if (config.offset !== undefined) out = sql`${out} offset ${config.offset}`;
 	return out;
@@ -230,56 +278,47 @@ const renderInner = (
  * through a column's decoder — a `timestamp_ms` comes back as a number and a
  * `boolean` as 0/1. Applying the decoders here is what makes the two plans
  * return equal values rather than merely equal shapes.
+ *
+ * `decodeColumns` is false at the top level only: those columns were selected
+ * directly, so the compiler has already decoded them, and decoding twice would
+ * hand a `Date` to a decoder expecting a number.
  */
-export function decodeJoined(row: Record<string, unknown>, shape: JoinedShape): Record<string, unknown> {
+export function decodeJoined(
+	row: Record<string, unknown>,
+	shape: JoinedShape,
+	decodeColumns = false,
+): Record<string, unknown> {
 	const out: Record<string, unknown> = {};
 
 	for (const [key, value] of Object.entries(row)) {
 		const relation = shape.relations[key];
+
 		if (!relation) {
-			// Top-level columns are decoded by the compiler already.
-			out[key] = value;
+			const decode = decodeColumns ? shape.columns[key] : undefined;
+			out[key] = decode && value !== null ? decode(value) : value;
 			continue;
 		}
 
+		// SQLite drops the JSON subtype when a value passes through a subquery,
+		// so a nested payload arrives as an escaped string rather than an
+		// object. Both spellings reach here, and both have to work.
 		const parsed = typeof value === 'string' ? JSON.parse(value) as unknown : value;
+
 		if (relation.many) {
 			out[key] = Array.isArray(parsed)
-				? parsed.map((entry) => decodeNested(entry as Record<string, unknown>, relation.shape))
+				? parsed.map((entry) => decodeJoined(entry as Record<string, unknown>, relation.shape, true))
 				: [];
-		} else {
-			out[key] = parsed === null || parsed === undefined
-				? undefined
-				: decodeNested(parsed as Record<string, unknown>, relation.shape);
+			continue;
 		}
+
+		// `null`, not `undefined`: the split plan returns null for an absent
+		// `one`, the declared type is `T | null`, and `undefined` additionally
+		// disappears from `JSON.stringify` — so an API response would lose the
+		// key rather than report it empty.
+		out[key] = parsed === null || parsed === undefined
+			? null
+			: decodeJoined(parsed as Record<string, unknown>, relation.shape, true);
 	}
 
 	return out;
 }
-
-/** As {@link decodeJoined}, but also decodes this level's own columns. */
-const decodeNested = (row: Record<string, unknown>, shape: JoinedShape): Record<string, unknown> => {
-	const out: Record<string, unknown> = {};
-
-	for (const [key, value] of Object.entries(row)) {
-		const relation = shape.relations[key];
-		if (relation) {
-			const parsed = typeof value === 'string' ? JSON.parse(value) as unknown : value;
-			if (relation.many) {
-				out[key] = Array.isArray(parsed)
-					? parsed.map((entry) => decodeNested(entry as Record<string, unknown>, relation.shape))
-					: [];
-			} else {
-				out[key] = parsed === null || parsed === undefined
-					? undefined
-					: decodeNested(parsed as Record<string, unknown>, relation.shape);
-			}
-			continue;
-		}
-
-		const decode = shape.columns[key];
-		out[key] = decode && value !== null ? decode(value) : value;
-	}
-
-	return out;
-};

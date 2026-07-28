@@ -612,7 +612,6 @@ describe('many-to-many through a junction table', () => {
 	const m2mDb = drizzle({ client: DB, relations: m2m });
 	const m2mJoined = drizzle({ client: DB, relations: m2m, relationalStrategy: 'joined' });
 
-
 	beforeEach(async () => {
 		for (const name of ['article_tags', 'tags', 'articles']) {
 			await DB.prepare(`drop table if exists "${name}"`).run();
@@ -715,6 +714,20 @@ describe('many-to-many through a junction table', () => {
  * decoded values, since a relation's payload arrives as JSON text and never
  * passes through a column's decoder on its own.
  */
+/**
+ * The two relational plans must be indistinguishable from the outside.
+ *
+ * `relationalStrategy: 'joined'` answers a `with` in one statement — correlated
+ * subqueries wrapped in `json_group_array` / `json_object` — instead of one
+ * query per level stitched in JS. That is a performance choice, so the results
+ * have to be *equal*, not merely similar.
+ *
+ * The cases are a table rather than a hand-picked list on purpose: the premise
+ * is that the two plans are interchangeable, so any config worth supporting is
+ * one row here. Every bug found in review — dropped `extras`, `undefined` where
+ * split returns `null`, `offset` without `limit`, blobs, over-wide payloads —
+ * is one row too.
+ */
 describe('joined strategy', () => {
 	const joined = drizzle({ client: DB, relations: schema.relations, relationalStrategy: 'joined' });
 
@@ -724,18 +737,99 @@ describe('joined strategy', () => {
 		return one;
 	};
 
-	it('agrees with the split plan on a `many` relation', async () => {
-		const rows = await bothAgree((d) =>
-			d.query.users.findMany({ with: { posts: true }, orderBy: { id: 'asc' } })
-		) as { posts: unknown[] }[];
+	const CASES: { name: string; run: (d: typeof db) => Promise<unknown> }[] = [
+		{
+			name: 'a many relation',
+			run: (d) => d.query.users.findMany({ with: { posts: true }, orderBy: { id: 'asc' } }),
+		},
+		{
+			name: 'a one relation',
+			run: (d) => d.query.posts.findMany({ with: { author: true }, orderBy: { id: 'asc' } }),
+		},
+		{
+			name: 'two levels of nesting',
+			run: (d) =>
+				d.query.users.findMany({
+					with: { posts: { with: { author: true }, orderBy: { id: 'asc' } } },
+					orderBy: { id: 'asc' },
+				}),
+		},
+		{
+			name: 'a column selection and a nested where',
+			run: (d) =>
+				d.query.users.findMany({
+					columns: { id: true, name: true },
+					with: { posts: { columns: { id: true, views: true }, where: { views: { gt: 4 } } } },
+					orderBy: { id: 'asc' },
+				}),
+		},
+		{
+			name: 'a nested order and limit',
+			run: (d) =>
+				d.query.users.findMany({
+					with: { posts: { orderBy: { views: 'desc' }, limit: 1 } },
+					orderBy: { id: 'asc' },
+				}),
+		},
+		{
+			name: 'a nested offset with a limit',
+			run: (d) =>
+				d.query.users.findMany({
+					with: { posts: { orderBy: { id: 'asc' }, limit: 1, offset: 1 } },
+					orderBy: { id: 'asc' },
+				}),
+		},
+		{
+			// SQLite parses OFFSET only as a suffix of LIMIT, so this used to be
+			// a syntax error under joined while split handled it.
+			name: 'a nested offset with no limit',
+			run: (d) =>
+				d.query.users.findMany({
+					with: { posts: { orderBy: { id: 'asc' }, offset: 1 } },
+					orderBy: { id: 'asc' },
+				}),
+		},
+		{
+			// Dropped silently before: the key simply vanished from the row.
+			name: 'extras at the top level',
+			run: (d) =>
+				d.query.users.findMany({
+					columns: { id: true },
+					extras: { shout: (t, { sql }) => sql`upper(${t.name})` },
+					with: { posts: { columns: { id: true } } },
+					orderBy: { id: 'asc' },
+				}),
+		},
+		{
+			name: 'extras inside a relation',
+			run: (d) =>
+				d.query.users.findMany({
+					columns: { id: true },
+					with: {
+						posts: {
+							columns: { id: true },
+							extras: { double: (t, { sql }) => sql`${t.views} * 2` },
+							orderBy: { id: 'asc' },
+						},
+					},
+					orderBy: { id: 'asc' },
+				}),
+		},
+		{
+			name: 'a plain one-to-many child table',
+			run: (d) => d.query.posts.findMany({ with: { tags: true }, orderBy: { id: 'asc' } }),
+		},
+		{
+			name: 'findFirst',
+			run: (d) => d.query.users.findFirst({ with: { posts: true }, orderBy: { id: 'asc' } }),
+		},
+	];
 
-		expect(rows).toHaveLength(2);
-		expect(rows[0]!.posts).toHaveLength(2);
-	});
-
-	it('agrees on a `one` relation', async () => {
-		await bothAgree((d) => d.query.posts.findMany({ with: { author: true }, orderBy: { id: 'asc' } }));
-	});
+	for (const { name, run } of CASES) {
+		it(`agrees with the split plan on ${name}`, async () => {
+			await bothAgree(run);
+		});
+	}
 
 	it('returns [] rather than null for a parent with no children', async () => {
 		await db.delete(schema.posts).where(eq(schema.posts.authorId, 2));
@@ -744,6 +838,20 @@ describe('joined strategy', () => {
 		) as { posts: unknown[] }[];
 
 		expect(rows[1]!.posts).toEqual([]);
+	});
+
+	it('returns null, not undefined, for an absent one relation', async () => {
+		// `undefined` is not merely a different spelling: the declared type is
+		// `T | null`, `row.x === null` stops working, and `JSON.stringify` drops
+		// the key entirely, so an API response loses the field.
+		await db.delete(schema.users).where(eq(schema.users.id, 2));
+		await db.delete(schema.posts).where(eq(schema.posts.id, 12));
+
+		const rows = await bothAgree((d) =>
+			d.query.postTags.findMany({ with: { post: true }, orderBy: { tag: 'asc' } })
+		) as Record<string, unknown>[];
+
+		for (const row of rows) expect('post' in row).toBe(true);
 	});
 
 	it('decodes nested values, not just their shape', async () => {
@@ -758,31 +866,20 @@ describe('joined strategy', () => {
 		expect(typeof rows[0]!.author.active).toBe('boolean');
 	});
 
-	it('agrees with a column selection and a nested where', async () => {
-		await bothAgree((d) =>
+	it('refuses a placeholder in a nested page under both plans', async () => {
+		// The joined plan *could* serve this: a correlated subquery pages per
+		// parent naturally. It deliberately does not, because the strategy is a
+		// performance switch and must not decide which queries are legal —
+		// flipping it for latency must never make working code throw, or
+		// broken code start working.
+		const run = (d: typeof db) =>
 			d.query.users.findMany({
-				columns: { id: true, name: true },
-				with: { posts: { columns: { id: true, views: true }, where: { views: { gt: 4 } } } },
+				with: { posts: { orderBy: { id: 'asc' }, limit: ph('n') } },
 				orderBy: { id: 'asc' },
-			})
-		);
-	});
+			}).execute({ n: 1 });
 
-	it('agrees on a nested order and limit', async () => {
-		await bothAgree((d) =>
-			d.query.users.findMany({
-				with: { posts: { orderBy: { views: 'desc' }, limit: 1 } },
-				orderBy: { id: 'asc' },
-			})
-		);
-	});
-
-	it('agrees on a plain one-to-many child table', async () => {
-		await bothAgree((d) => d.query.posts.findMany({ with: { tags: true }, orderBy: { id: 'asc' } }));
-	});
-
-	it('agrees on findFirst', async () => {
-		await bothAgree((d) => d.query.users.findFirst({ with: { posts: true }, orderBy: { id: 'asc' } }));
+		await expect(run(db)).rejects.toThrow(/cannot be a placeholder/);
+		await expect(run(joined)).rejects.toThrow(/cannot be a placeholder/);
 	});
 });
 

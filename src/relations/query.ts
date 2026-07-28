@@ -14,7 +14,7 @@
  * filter DSL instead of a callback, an object form for `orderBy`, a callback
  * form for `extras` — not the executor itself.
  */
-import type { D1zzleDatabase } from '../runtime/database.js';
+import type { D1zzleDatabase, RelationalStrategy } from '../runtime/database.js';
 import type { Column } from '../schema/columns.js';
 import type { Table } from '../schema/table.js';
 import { alias, getTableColumns } from '../schema/table.js';
@@ -25,6 +25,7 @@ import type { Placeholder, RenderContext, SQLChunk } from '../sql/sql.js';
 import { render, sql } from '../sql/sql.js';
 import type { Relation, RelationsConfig, TableRelationalConfig } from './define.js';
 import { buildLevel, decodeJoined, supportsJoined } from './joined.js';
+import { fieldNameOf, pickColumns } from './projection.js';
 import type { RelationsFilter } from './filter.js';
 import { compileFilter, filterOperators } from './filter.js';
 
@@ -147,18 +148,6 @@ const resolveExtras = (
 	return resolved;
 };
 
-/** Which columns to project: explicit `true`s win; otherwise all but the `false`s. */
-const pickColumns = (
-	all: Record<string, Column<any>>,
-	selection: Record<string, boolean | undefined> | undefined,
-): string[] => {
-	const keys = Object.keys(all);
-	if (!selection) return keys;
-	const included = keys.filter((key) => selection[key] === true);
-	if (included.length > 0) return included;
-	return keys.filter((key) => selection[key] !== false);
-};
-
 /**
  * One stitching-key component.
  *
@@ -256,7 +245,7 @@ export class RelationalQueryBuilder {
 		private readonly db: D1zzleDatabase,
 		private readonly schema: RelationsConfig,
 		private readonly config: TableRelationalConfig,
-		private readonly strategy: 'split' | 'joined' = 'split',
+		private readonly strategy: RelationalStrategy = 'split',
 	) {}
 
 	/**
@@ -296,6 +285,7 @@ export class RelationalQueryBuilder {
 					this.schema,
 				),
 			(levelConfig, columns) => resolveOrderBy(levelConfig.orderBy, columns),
+			(levelConfig, columns) => resolveExtras(levelConfig.extras, columns),
 		);
 
 		let builder = this.db.select(level.selection).from(root as never)
@@ -523,7 +513,7 @@ export class RelationalQueryBuilder {
 			? { ...(limit !== undefined ? { limit } : {}), ...(offset !== undefined ? { offset } : {}) }
 			: undefined;
 
-		const nested = new RelationalQueryBuilder(this.db, this.schema, targetConfig);
+		const nested = new RelationalQueryBuilder(this.db, this.schema, targetConfig, this.strategy);
 
 		const runFor = (subset: readonly unknown[][]): Promise<Record<string, unknown>[]> =>
 			nested.#run(entry.config, childFieldNames, true, {
@@ -641,13 +631,6 @@ const dropKeys = <T extends Record<string, unknown>>(rows: T[], keys: readonly s
 		for (const key of keys) delete row[key];
 	}
 	return rows;
-};
-
-const fieldNameOf = (columns: Record<string, Column<any>>, column: Column<any>): string => {
-	for (const [key, candidate] of Object.entries(columns)) {
-		if (candidate.name === column.name) return key;
-	}
-	return column.name;
 };
 
 /**

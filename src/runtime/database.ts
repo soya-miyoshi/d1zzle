@@ -17,6 +17,13 @@ import type { QueryEvent } from './result.js';
 import type { D1Target, ResolvedOptions } from './session.js';
 import { Executor } from './session.js';
 
+/**
+ * Spelled here rather than imported from `relations/`: that module imports this
+ * one, and a value-level cycle between them is not worth a shared alias. The
+ * canonical name is re-exported as `RelationalStrategy`.
+ */
+export type RelationalStrategy = 'split' | 'joined';
+
 export interface D1zzleOptions {
 	/** Applied to column names that don't specify one explicitly. */
 	casing?: 'preserve' | 'snake_case';
@@ -43,7 +50,7 @@ export interface D1zzleOptions {
 	 * real D1 database. A query the joined plan cannot express — a
 	 * many-to-many across a junction — falls back to `'split'` on its own.
 	 */
-	relationalStrategy?: 'split' | 'joined';
+	relationalStrategy?: RelationalStrategy;
 	/**
 	 * Accepted and ignored. v0 took a schema module here; v1 takes the result
 	 * of `defineRelations` as `relations`, which the root `drizzle()` reads.

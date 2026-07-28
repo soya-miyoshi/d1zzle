@@ -220,7 +220,8 @@ export interface RelationalMeta<TRelations> {
  * the relational layer stays out of the core bundle for anyone who does not
  * pass relations, and so it can be attached to an existing db after the fact.
  */
-export type RelationalStrategy = 'split' | 'joined';
+export type { RelationalStrategy } from '../runtime/database.js';
+import type { RelationalStrategy } from '../runtime/database.js';
 
 export function withRelations<TRelations extends RelationsConfig>(
 	db: D1zzleDatabase,
