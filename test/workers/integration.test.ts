@@ -216,6 +216,33 @@ describe('joins', () => {
 
 		expect(await db.select({ id: popular.id }).from(popular)).toEqual([{ id: 11 }]);
 	});
+
+	it('selects from a subquery over a join, which renames the whole projection', async () => {
+		// The compiled-SQL version of this is in the unit suite; this is the
+		// half that matters, because the symptom was `no such column` from D1
+		// rather than anything visible at compile time. A subquery whose
+		// declared surface disagreed with its own statement typechecked, read
+		// correctly, and only failed here.
+		const db = d1zzle(DB);
+		const s = db.select().from(posts).innerJoin(users, eq(users.id, posts.authorId)).as('s');
+
+		const rows = await db.select({ title: s.posts.title, author: s.users.name })
+			.from(s)
+			.where(gt(s.posts.views, 10));
+
+		expect(rows).toEqual([{ title: 'second', author: 'Ada' }]);
+	});
+
+	it('runs an implicit select over such a subquery, regrouped as it went in', async () => {
+		const db = d1zzle(DB);
+		const s = db.select().from(posts).innerJoin(users, eq(users.id, posts.authorId)).as('s');
+
+		const rows = await db.select().from(s).where(gt(s.posts.views, 10));
+
+		// `from(s)` with no selection reads the subquery's own columns back out,
+		// so the nesting has to survive a round trip through `.as()`.
+		expect(rows).toEqual([{ posts: expect.objectContaining({ title: 'second' }), users: expect.objectContaining({ name: 'Ada' }) }]);
+	});
 });
 
 describe('expressions against real SQLite', () => {

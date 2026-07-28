@@ -4,7 +4,14 @@ import { exceedsBytes, MAX_STATEMENT_BYTES } from '../limits.js';
 import type { Column } from '../schema/columns.js';
 import { isColumn } from '../schema/columns.js';
 import type { Table } from '../schema/table.js';
-import { getTableColumns, getTableName, getTableOriginalName, getTableSource, isAliased } from '../schema/table.js';
+import {
+	getFlatColumns,
+	getTableColumns,
+	getTableName,
+	getTableOriginalName,
+	getTableSource,
+	isAliased,
+} from '../schema/table.js';
 import { hasDecode } from '../sql/functions.js';
 import type { ParamSlot, Query, RenderContext, SQLChunk } from '../sql/sql.js';
 import { isPlaceholder, isSQLChunk, quoteIdentifier, render, resolveParamBudget } from '../sql/sql.js';
@@ -147,6 +154,38 @@ const assignKeys = (leaves: readonly Leaf[]): string[] => {
 	const natural = leaves.map((leaf) => leaf.natural);
 	const collides = new Set(natural).size !== natural.length;
 	return collides ? leaves.map((_, i) => `c${i}`) : natural;
+};
+
+/** One output column of a select, as the statement will actually name it. */
+export interface ProjectedColumn {
+	/** Where it sits in the row: `['id']`, or `['users', 'id']` under a join. */
+	readonly path: readonly string[];
+	/** The name the statement emits — `c0…cN` once anything collides. */
+	readonly key: string;
+	/** Set when the projected expression is a plain column. */
+	readonly column: Column<any> | undefined;
+	readonly decode: ((value: unknown) => unknown) | undefined;
+}
+
+/**
+ * The projection a plan will compile to, without compiling it.
+ *
+ * `.as()` needs exactly this and cannot recompute it: deriving the names from
+ * `plan.selection` misses `assignKeys`' renaming, and falling back to the
+ * `from` table's columns misses every joined table. Both produced a subquery
+ * whose declared surface named columns the statement inside it does not emit —
+ * `no such column`, from SQL that looked right.
+ */
+export const projectedColumns = (plan: SelectPlan): readonly ProjectedColumn[] => {
+	const selection = plan.selection ?? implicitSelection(plan).selection;
+	const leaves = flattenSelection(selection);
+	const keys = assignKeys(leaves);
+	return leaves.map((leaf, i) => ({
+		path: leaf.path,
+		key: keys[i]!,
+		column: leaf.column,
+		decode: leaf.decode,
+	}));
 };
 
 const writeProjection = (
@@ -348,7 +387,7 @@ const defaultChunk = (column: Column<any>): SQLChunk => ({
 });
 
 export function compileInsert<TRow>(plan: InsertPlan, ctx: RenderContext): CompiledQuery<TRow> {
-	const columns = getTableColumns(plan.table);
+	const columns = getFlatColumns(plan.table);
 	if (plan.values.length === 0) throw new CompileError('insert().values([]) has nothing to insert.');
 
 	// Rows with different key sets cannot share one VALUES list, so consecutive
@@ -491,7 +530,7 @@ const writeAssignments = (
 };
 
 export function compileUpdate<TRow>(plan: UpdatePlan, ctx: RenderContext): CompiledQuery<TRow> {
-	const columns = getTableColumns(plan.table);
+	const columns = getFlatColumns(plan.table);
 	const writer = new Writer(ctx);
 
 	// `undefined` means "not set", the same as absent — `{ x: cond ? v : undefined }`

@@ -198,6 +198,78 @@ describe('select compilation', () => {
 		);
 	});
 
+	/**
+	 * A subquery's declared columns have to name what the statement inside it
+	 * actually emits.
+	 *
+	 * `assignKeys` renames the whole projection to `c0…cN` the moment two leaves
+	 * share a name, which every nested selection and every implicit join
+	 * produces. The subquery surface was derived from `plan.selection` instead —
+	 * or, with no explicit selection, from the `from` table's columns, which
+	 * drops the joined tables entirely — so it named columns that were not
+	 * there. Both spellings compiled cleanly and failed at D1 with `no such
+	 * column`, which is why these assert on the emitted text.
+	 */
+	describe('a subquery over a renamed projection', () => {
+		it('references an implicit join by the name the inner statement emits', () => {
+			const s = query.select().from(posts)
+				.innerJoin(users, eq(users.id, posts.authorId))
+				.as('s');
+
+			const compiled = query.select({ id: s.posts.id, who: s.users.email }).from(s).compile();
+
+			// `posts.id` is leaf 0 and `users.email` is leaf 5 of the flattened
+			// projection — the outer select has to use those, not "id"/"email".
+			expect(compiled.sql).toContain('select "s"."c0" as "id", "s"."c5" as "who" from (');
+			expect(compiled.sql).toContain('"posts"."id" as "c0"');
+			expect(compiled.sql).toContain('"users"."email" as "c5"');
+		});
+
+		it('exposes every joined table, not just the one in `from`', () => {
+			const s = query.select().from(posts)
+				.innerJoin(users, eq(users.id, posts.authorId))
+				.as('s');
+
+			// The whole `users` group used to be missing from the surface.
+			expect(Object.keys(s.users)).toEqual([
+				'id',
+				'email',
+				'name',
+				'role',
+				'active',
+				'settings',
+				'score',
+				'createdAt',
+				'updatedAt',
+			]);
+			expect(Object.keys(s.posts)).toEqual(['id', 'authorId', 'title', 'views']);
+		});
+
+		it('does the same for a nested explicit selection', () => {
+			const s = query.select({ u: { id: users.id }, p: { id: posts.id } })
+				.from(posts)
+				.innerJoin(users, eq(users.id, posts.authorId))
+				.as('s');
+
+			const compiled = query.select({ a: s.u.id, b: s.p.id }).from(s).compile();
+
+			expect(compiled.sql).toBe(
+				'select "s"."c0" as "a", "s"."c1" as "b" from (select "users"."id" as "c0", "posts"."id" as "c1" '
+					+ 'from "posts" inner join "users" on "users"."id" = "posts"."author_id") "s"',
+			);
+		});
+
+		it('leaves a flat projection naming its own columns', () => {
+			// Nothing collides, so nothing is renamed and the surface is the
+			// selection's own keys — the case that always worked, pinned so the
+			// fix cannot regress it into `c0`.
+			const s = query.select({ id: posts.id, views: posts.views }).from(posts).as('s');
+			const compiled = query.select({ id: s.id }).from(s).compile();
+
+			expect(compiled.sql).toBe('select "s"."id" from (select "posts"."id", "posts"."views" from "posts") "s"');
+		});
+	});
+
 	it('uses a select as an inArray operand', () => {
 		const authors = query.select({ id: posts.authorId }).from(posts);
 		const compiled = query.select({ id: users.id }).from(users)

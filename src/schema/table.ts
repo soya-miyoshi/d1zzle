@@ -3,6 +3,7 @@ import { MAX_COLUMNS_PER_TABLE } from '../limits.js';
 import type { Query, SQLChunk } from '../sql/sql.js';
 import { quoteIdentifier } from '../sql/sql.js';
 import type { Column, ColumnBuilder, ColumnMeta, ReferentialAction } from './columns.js';
+import { isColumn } from './columns.js';
 import type { TableExtra } from './constraints.js';
 import { foreignKeyName, indexName, isTableExtra, primaryKeyName, uniqueConstraintName } from './constraints.js';
 import {
@@ -26,7 +27,16 @@ export const TableColumns = Symbol.for('d1zzle:TableColumns');
 export const TableExtras = Symbol.for('d1zzle:TableExtras');
 export const IsTable = Symbol.for('d1zzle:IsTable');
 
-export type ColumnsMap = Record<string, Column<any>>;
+/**
+ * A table's columns by TypeScript name.
+ *
+ * Nested for subqueries only: a join or a nested selection produces grouped
+ * rows, so `sq.users.id` is the honest surface for the statement inside. A
+ * declared table is always flat.
+ */
+export interface ColumnsMap {
+	[key: string]: Column<any> | ColumnsMap;
+}
 
 export interface TableMeta<TColumns extends ColumnsMap, TName extends string = string> extends SQLChunk {
 	readonly [IsTable]: true;
@@ -100,7 +110,15 @@ const buildTable = (
 	};
 
 	const t = Object.assign(new D1zzleTable(), columns, meta, drizzleMeta) as unknown as Table;
-	for (const column of Object.values(columns)) column.table = t;
+	// Skips a nested group, which only a subquery over grouped rows produces.
+	// Its leaves still get a `table`, one level down.
+	const own = (map: ColumnsMap): void => {
+		for (const entry of Object.values(map)) {
+			if (isColumn(entry)) entry.table = t;
+			else own(entry as ColumnsMap);
+		}
+	};
+	own(columns);
 	return t;
 };
 
@@ -157,6 +175,17 @@ export const isTable = (value: unknown): value is Table =>
 export const getTableName = (t: Table): string => t[TableName];
 export const getTableOriginalName = (t: Table): string => t[TableOriginalName];
 export const getTableColumns = <T extends Table>(t: T): T[typeof TableColumns] => t[TableColumns];
+
+/**
+ * Columns of a *declared* table, which is always flat.
+ *
+ * `getTableColumns` has to admit nesting, because a subquery over grouped rows
+ * exposes `sq.users.id`. Everywhere that is holding a table it declared — the
+ * write compilers, chiefly — that case cannot arise, and saying so once beats
+ * a cast at each use.
+ */
+export const getFlatColumns = (t: Table): Record<string, Column<any>> =>
+	getTableColumns(t) as Record<string, Column<any>>;
 export const getTableExtras = (t: Table): readonly TableExtra[] => t[TableExtras];
 
 /**
@@ -310,11 +339,22 @@ export function alias<T extends Table, TName extends string>(
 	t: T,
 	aliasName: TName,
 ): T extends Table<infer C> ? Table<C, TName> : never {
-	const columns: ColumnsMap = {};
-	for (const [key, column] of Object.entries(getTableColumns(t))) {
-		columns[key] = column.withTable(aliasName);
-	}
-	return buildTable(aliasName, getTableOriginalName(t), columns, getTableExtras(t), true) as any;
+	// Recursive because a subquery over grouped rows nests its columns, and a
+	// subquery is a table everywhere except the `from` clause.
+	const rebind = (map: ColumnsMap): ColumnsMap => {
+		const out: ColumnsMap = {};
+		for (const [key, entry] of Object.entries(map)) {
+			out[key] = isColumn(entry) ? entry.withTable(aliasName) : rebind(entry as ColumnsMap);
+		}
+		return out;
+	};
+	return buildTable(
+		aliasName,
+		getTableOriginalName(t),
+		rebind(getTableColumns(t)),
+		getTableExtras(t),
+		true,
+	) as any;
 }
 
 export const isAliased = (t: Table): boolean => t[TableName] !== t[TableOriginalName];
